@@ -1,0 +1,8 @@
+faster-whisper
+ctranslate2
+PySide6
+requests
+edge-tts
+av
+watchdog
+huggingface_hub

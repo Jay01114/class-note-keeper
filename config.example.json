@@ -1,0 +1,11 @@
+{
+  "inbox_dir": "./inbox",
+  "vault_dir": "./vault",
+  "models_dir": "./models",
+  "whisper_model": "./models/faster-whisper-medium",
+  "whisper_compute": "int8",
+  "ollama_host": "http://127.0.0.1:11434",
+  "ollama_model": "qwen2.5:7b",
+  "subjects": ["概率论", "离散数学", "电路、信号和系统", "数字逻辑和计算机组成"],
+  "supported_ext": [".m4a", ".mp3", ".wav", ".aac", ".flac", ".opus", ".ogg", ".amr", ".wma", ".mp4"]
+}

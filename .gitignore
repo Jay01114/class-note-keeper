@@ -1,0 +1,55 @@
+# ========== Python 通用 ==========
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ========== 构建产物 ==========
+build/
+dist/
+*.spec
+
+# ========== 运行配置与本地数据（关键） ==========
+# 真实配置文件绝不上传（仓库只保留 config.example.json）
+config.json
+config.local.json
+
+# 日志（含调试日志，可能暴露本机路径）
+*.log
+ollama_debug.log
+
+# 本地模型权重（数百 MB ~ 数 GB，走 HuggingFace 下载，不入库）
+models/
+
+# 用户数据目录（录音、笔记、失败/重复文件）
+inbox/
+vault/
+_失败/
+_重复/
+
+# ========== 凭据与密钥（防御性） ==========
+.env
+.env.*
+*.pem
+*.key
+*.p12
+id_rsa
+id_ed25519
+*.secret
+credentials.json
+service-account*.json
+.ollama/
+
+# ========== 系统与编辑器 ==========
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.local
