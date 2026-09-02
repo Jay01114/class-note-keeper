@@ -2,6 +2,7 @@ faster-whisper
 ctranslate2
 PySide6
 requests
+json5
 edge-tts
 av
 watchdog

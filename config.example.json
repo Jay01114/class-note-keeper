@@ -7,5 +7,45 @@
   "ollama_host": "http://127.0.0.1:11434",
   "ollama_model": "qwen2.5:7b",
   "subjects": ["概率论", "离散数学", "电路、信号和系统", "数字逻辑和计算机组成"],
-  "supported_ext": [".m4a", ".mp3", ".wav", ".aac", ".flac", ".opus", ".ogg", ".amr", ".wma", ".mp4"]
+  "supported_ext": [".m4a", ".mp3", ".wav", ".aac", ".flac", ".opus", ".ogg", ".amr", ".wma", ".mp4"],
+  "knowledge": {
+    "enabled": true,
+    "max_gap_items": 5,
+    "max_sentences": 4,
+    "search_backend": "wikipedia",
+    "wiki_lang": "zh",
+    "wiki_endpoint": "https://proxy.littlejoy.live/api/wikipedia/zh",
+    "wiki_proxy": "",
+    "wiki_unreachable_policy": "high_only",
+    "mark_patched": true
+  },
+  "term_fixes": {
+    "离散数学": [
+      ["柔耻原理", "容斥原理"],
+      ["柔齿原理", "容斥原理"],
+      ["柔次原理", "容斥原理"],
+      ["容赤原理", "容斥原理"],
+      ["容式原理", "容斥原理"],
+      ["融出原理", "容斥原理"],
+      ["农事原理", "容斥原理"],
+      ["单色", "单射"],
+      ["满色", "满射"],
+      ["双色", "双射"],
+      ["满设", "满射"],
+      ["错排如 5, 4, 3, 2, 1", "错排如 (2, 3, 4, 5, 1)"]
+    ],
+    "概率论": [
+      ["柔耻原理", "容斥原理"],
+      ["柔齿原理", "容斥原理"],
+      ["农事原理", "容斥原理"],
+      ["单色", "单射"],
+      ["满色", "满射"],
+      ["双色", "双射"],
+      ["满设", "满射"],
+      ["刺客家境", "数学归纳法"],
+      ["数学规范法", "数学归纳法"],
+      ["克鲁姆克洛夫", "柯尔莫哥洛夫"],
+      ["错排如 5, 4, 3, 2, 1", "错排如 (2, 3, 4, 5, 1)"]
+    ]
+  }
 }

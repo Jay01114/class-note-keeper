@@ -65,6 +65,7 @@ faster-whisper
 ctranslate2
 PySide6
 requests
+json5
 edge-tts
 av
 watchdog
@@ -83,7 +84,32 @@ huggingface_hub
   "ollama_host": "http://127.0.0.1:11434",
   "ollama_model": "qwen2.5:7b",                      // 纪要模型
   "subjects": ["概率论", "离散数学", "电路、信号和系统", "数字逻辑和计算机组成"],  // 固定学科列表
-  "supported_ext": [".m4a", ".mp3", ".wav", ".aac", ".flac", ".opus", ".ogg", ".amr", ".wma", ".mp4"]
+  "supported_ext": [".m4a", ".mp3", ".wav", ".aac", ".flac", ".opus", ".ogg", ".amr", ".wma", ".mp4"],
+
+  // 知识补全（[补] 标记）：纪要归档后，7B 检测转写里讲得含糊/缺失的知识点，
+  // 高置信候选经维基百科查证后内嵌补回纪要。全免费无 key。
+  "knowledge": {
+    "enabled": true,
+    "max_gap_items": 5,
+    "max_sentences": 4,
+    "search_backend": "wikipedia",
+    "wiki_lang": "zh",
+    "wiki_endpoint": "https://proxy.littlejoy.live/api/wikipedia/zh", // 国内可达的维基 API 代理；海外可直接用 https://zh.wikipedia.org/w/api.php
+    "wiki_proxy": "",                                 // 如需走代理查维基可在此填 http://...（留空直连）
+    "wiki_unreachable_policy": "high_only",           // 维基不可达时：仅高置信 7B 候选落盘
+    "mark_patched": true
+  },
+
+  // 术语纠错表（语音识别谐音误写 → 标准术语，按学科分组）。
+  // 只放"标准语境下几乎必为误写"的高置信词；生成纪要前后各自动替换一次。
+  "term_fixes": {
+    "离散数学": [
+      ["柔耻原理", "容斥原理"], ["柔齿原理", "容斥原理"], ["满色", "满射"], ["单色", "单射"], ["双色", "双射"]
+    ],
+    "概率论": [
+      ["克鲁姆克洛夫", "柯尔莫哥洛夫"], ["刺客家境", "数学归纳法"]
+    ]
+  }
 }
 ```
 
@@ -119,3 +145,12 @@ hf-mirror 镜像 + 断点续传（重跑下载命令即可续传）。
 
 **Q：Ollama 弹终端窗口？**
 应用已用 `CREATE_NO_WINDOW + SW_HIDE` 拉起 serve；如仍异常，请手动 `ollama serve` 确认可用。
+
+**Q：2 小时以上的长录音会丢内容吗？**
+不会。纪要采用「分段整理 + 程序拼接」：转写按 12000 字符切成多段，每段独立交给 7B 整理成草稿，再由程序按小节归并、条目去重后拼成整门课纪要。不依赖模型一次性读完全文，已有内容零丢失（旧版只喂前 2 万字符导致后半截被丢弃的问题已修复）。
+
+**Q：纪要里 `[补]` 标记是什么？**
+知识补全功能（`knowledge` 配置）。AI 纪要里原文讲不全或录音听不清的知识点，会以 `[补]` 前缀内嵌补回正确内容；补全候选需经维基百科查证，查证不可达时宁缺毋滥。不想要可设 `knowledge.enabled: false`。
+
+**Q：识别出来的术语是谐音错字（如"容赤原理"）？**
+语音识别对专业术语常产生谐音误写。可在 `term_fixes` 对应学科下加 `["错误写法", "正确写法"]`，生成纪要前后会自动整词替换（只替换表内高置信词，对正确内容无副作用）。

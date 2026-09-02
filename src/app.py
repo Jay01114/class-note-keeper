@@ -88,6 +88,7 @@ class OllamaManager:
     def __init__(self):
         self.started_by_us = False
         self.proc = None
+        self._fh = None
 
     def ensure(self):
         """管家启动时调用：Ollama 未运行则拉起 serve（SW_HIDE 防 Windows Terminal 弹窗）"""
@@ -100,10 +101,18 @@ class OllamaManager:
             si = subprocess.STARTUPINFO()
             si.dwFlags = subprocess.STARTF_USESHOWWINDOW
             si.wShowWindow = subprocess.SW_HIDE
+            # stdout/stderr 必须重定向到文件：windowed exe 的标准句柄无效，
+            # 直接继承会让 serve 的日志/GPU 初始化行为异常（实测 7B 生成慢 3-4 倍、GPU 100%）
+            _log_dir = Path(APP_DIR).parent / "tmp"
+            _log_dir.mkdir(parents=True, exist_ok=True)
+            _fh = open(_log_dir / "ollama_serve.log", "a", encoding="utf-8", errors="replace")
+            self._fh = _fh
             self.proc = subprocess.Popen(
                 [str(OLLAMA_EXE), "serve"],
                 startupinfo=si,
                 creationflags=subprocess.CREATE_NO_WINDOW,
+                stdout=_fh,
+                stderr=_fh,
             )
             self.started_by_us = True
             for _ in range(20):  # 最多等 10 秒就绪
@@ -122,6 +131,12 @@ class OllamaManager:
             if self.proc:
                 self.proc.terminate()
                 time.sleep(1.5)
+        except Exception:
+            pass
+        try:
+            if self._fh:
+                self._fh.close()
+                self._fh = None
         except Exception:
             pass
         self.started_by_us = False
@@ -259,7 +274,8 @@ class Worker(QThread):
             self.task_state.emit(name, "AI 整理中…")
             note = core.generate_note(text)
             # ---- 归档 ----
-            core.archive(p, text, note, file_hash=h)
+            note_path = core.archive(p, text, note, file_hash=h)
+            core.knowledge_patch(note_path, text, note)   # 归档后自动知识补全（7B + 维基查证）
             core.PROCESSED_HASHES.add(h)
             self.task_meta.emit(name, note.get("subject", ""), note.get("title", ""))
             self.task_state.emit(name, "完成")
