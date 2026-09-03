@@ -124,7 +124,10 @@ def fix_terms(text: str, subject: str) -> str:
 # ---------------- 纪要 + 学科识别 ----------------
 def ollama_chat(prompt: str, num_predict: int = None) -> str:
     url = CFG["ollama_host"] + "/api/chat"
-    options = {"num_ctx": 49152, "temperature": 0.2}
+    # num_ctx=16384（2026-09-03 调低）：7B Q4 显存账 4.7GB + 16k ctx KV ~1.3GB + CUDA 开销
+    # ≈ 6.4GB，8GB 卡留 ~1.6GB 安全冗余。此前 49152 的 KV ~3.9GB → 合计 ~9GB 超显存，
+    # 长录音分多段连续调用时 GPU 逐步耗尽，段 3 后降速、段 4 直接 1800s read timeout 卡死。
+    options = {"num_ctx": 16384, "temperature": 0.2}
     if num_predict:
         options["num_predict"] = num_predict  # 输出安全阀：防 7B 话痨无限生成卡死（如单段纪要 4500 token）
     payload = {
@@ -166,9 +169,11 @@ TITLE: 本节课标题
     }
 
 
-def _split_segments(text: str, seg_chars: int = 12000, overlap: int = 1200) -> list:
+def _split_segments(text: str, seg_chars: int = 8000, overlap: int = 1200) -> list:
     """按字符数切段，段间重叠 overlap 字符（避免知识点恰好被切断在边界）。
-    12000 字符/段：控制单轮输入(转写片段+模板)在 num_ctx 内，避免超上下文截断丢内容。"""
+    8000 字符/段（2026-09-03 调低）：配合 num_ctx=16384 —— 单段 ~8000 字符转写
+    (≈4500-6000 tokens) + 指令模板 ~1000 + 输出上限 4500 ≤ ~11500 < 16384，不截断。
+    此前 12000 字符/段 + num_ctx=49152 显存超载导致长录音第 4 段 1800s 卡死。"""
     lines = text.splitlines()
     segs, cur, cur_len = [], [], 0
     for ln in lines:
