@@ -28,6 +28,11 @@ import core
 APP_DIR = Path(__file__).parent
 OLLAMA_EXE = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe"
 OLLAMA_URL = core.CFG.get("ollama_host", "http://127.0.0.1:11434") + "/api/version"
+# Ollama 模型目录：首次安装由 install.bat 用 setx 写入用户环境变量。
+# 但 setx 只写注册表、不影响已开的会话/进程；且双击 exe 启动时若变量缺失，
+# serve 会回退到默认目录（C 盘）→ 模型列表为 0 → 所有 /api/chat 返回 404。
+# 因此这里显式兜底传入，保证无论从哪启动都能找到配置的模型目录。
+OLLAMA_MODELS_DIR = Path(core.CFG.get("models_dir", "models")) / "ollama"
 
 # 转写模型档位：路径基于配置的 models_dir 拼接（可配置）
 _MODELS_DIR = core.CFG.get("models_dir", "models")
@@ -73,6 +78,24 @@ def _ollama_running() -> bool:
         return False
 
 
+def _ollama_has_model(model: str = None) -> bool:
+    """确认 serve 真的加载到了目标模型。
+    仅探测端口存活不够：若 OLLAMA_MODELS 指向错误，serve 正常响应但模型列表为空，
+    之后每个课时的 /api/chat 都会 404 白白浪费一整轮转写。"""
+    model = model or core.CFG.get("ollama_model", "qwen2.5:7b")
+    try:
+        import requests
+        host = core.CFG.get("ollama_host", "http://127.0.0.1:11434")
+        r = requests.get(host + "/api/tags", timeout=2.5)
+        if r.status_code != 200:
+            return False
+        names = [m.get("name", "") for m in r.json().get("models", [])]
+        base = model.split(":")[0]
+        return any(n == model or n.split(":")[0] == base for n in names)
+    except Exception:
+        return False
+
+
 def _debug_log(msg: str):
     try:
         log_path = core.CONFIG_PATH.parent / "ollama_debug.log"
@@ -107,12 +130,17 @@ class OllamaManager:
             _log_dir.mkdir(parents=True, exist_ok=True)
             _fh = open(_log_dir / "ollama_serve.log", "a", encoding="utf-8", errors="replace")
             self._fh = _fh
+            # 显式带上 OLLAMA_MODELS：不依赖用户环境变量（setx 不刷新当前会话；
+            # 且双击 exe 启动时可能未继承）→ 防止 serve 回退默认目录、模型列表为 0
+            env = os.environ.copy()
+            env["OLLAMA_MODELS"] = str(OLLAMA_MODELS_DIR)
             self.proc = subprocess.Popen(
                 [str(OLLAMA_EXE), "serve"],
                 startupinfo=si,
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 stdout=_fh,
                 stderr=_fh,
+                env=env,
             )
             self.started_by_us = True
             for _ in range(20):  # 最多等 10 秒就绪
