@@ -115,10 +115,133 @@ def fix_terms(text: str, subject: str) -> str:
     fixes = CFG.get("term_fixes", {}).get(subject, [])
     if not fixes:
         return text
+    # 2026-09-03：长词优先（Python sorted 稳定，同长保持配置顺序），
+    # 防止短规则先命中、把长规则待匹配串改掉
+    fixes = sorted(fixes, key=lambda p: len(p[0]), reverse=True)
     for wrong, right in fixes:
         if wrong in text:
             text = text.replace(wrong, right)
     return text
+
+
+# ---------------- 标准术语词库（term_dict/*.json → prompt 锚点注入） ----------------
+# 2026-09-03 接入：四科词库由本地 qwen2.5:7b 按章节生成 + 维基校验打标（term_glossary.py 产物），
+# 存 {term_dict_dir}/{学科}.json（terms=[{ch,t,v}]）。用途：把标准术语名单注入 _summarize /
+# knowledge 补全 prompt，让 7B 遇到音近词时按标准写法书写（软约束；fix_terms 仍是硬兜底）。
+# 词库文件缺失时静默降级为空（不注入），不影响主流程。
+
+
+def _term_dict_path(subject: str) -> Path:
+    """定位 {subject}.json：config 显式 term_dict_dir 优先，其次 app 同级/项目根。"""
+    rel = (CFG.get("term_dict_dir") or "").strip()
+    cands = []
+    if rel:
+        p = Path(rel)
+        cands.append(p if p.is_absolute() else CONFIG_PATH.parent / p)
+    cands += [
+        Path(__file__).parent / "term_dict",
+        Path(__file__).parent.parent / "term_dict",
+    ]
+    for c in cands:
+        f = c / f"{subject}.json"
+        if f.exists():
+            return f
+    return cands[-1] / f"{subject}.json"
+
+
+def _load_subject_terms(subject: str) -> list:
+    """读词库 → [(term, 校验层 v, 章节 ch)]；文件不存在/损坏返回空（不抛异常）。"""
+    try:
+        p = _term_dict_path(subject)
+        if not p.exists():
+            return []
+        d = json.load(open(p, encoding="utf-8"))
+        terms = d.get("terms") or []
+        return [(t["t"], t.get("v", ""), t.get("ch", "")) for t in terms
+                if isinstance(t, dict) and t.get("t")]
+    except Exception:
+        return []
+
+
+_term_guide_cache = {}
+
+# 2026-09-03：每科「核心保底词」——课堂高频且音近易错的标准术语，硬性进入锚点名单。
+# 键为词库中词条的关键词（支持精确/包含匹配，词库缺失则跳过不报错）。
+_GUIDE_MUST = {
+    "数字逻辑和计算机组成": ["真值表", "卡诺图", "与非门", "或非门", "触发器", "Verilog",
+                    "寄存器", "补码", "最小项", "最大项", "译码器", "全加器", "锁存器", "总线"],
+    "概率论": ["随机变量", "概率密度", "分布函数", "正态分布", "大数定律", "中心极限定理",
+               "数学期望", "方差", "协方差", "贝叶斯", "假设检验", "置信区间", "泊松", "二项分布"],
+    "离散数学": ["单射", "满射", "双射", "容斥原理", "等价关系", "偏序", "数学归纳法",
+               "欧拉图", "哈密顿", "命题", "谓词", "幂集", "笛卡尔积"],
+    "电路、信号和系统": ["基尔霍夫", "欧姆定律", "叠加定理", "戴维南", "诺顿", "傅里叶变换",
+                 "拉普拉斯变换", "Z变换", "卷积", "采样定理", "滤波器", "传递函数", "相量", "阻抗"],
+}
+
+
+def _term_guide(subject: str) -> str:
+    """按学科生成术语锚点段（2~6 字词，wiki 层优先，≤term_inject_max 条，按章节均衡）。
+    2026-09-03 改：①原按词库顺序取前 N 个 wiki 词会被大章节占满名额 → 章节轮转采样；
+    ②再加 _GUIDE_MUST 核心词保底置顶（含 6~7 字长词如"拉普拉斯变换/Verilog"，避开长度过滤）。
+    无词库/词条不足时返回 ""（调用方拼接时跳过）。"""
+    if not subject:
+        return ""
+    if subject in _term_guide_cache:
+        return _term_guide_cache[subject]
+    max_n = int(CFG.get("term_inject_max", 80) or 80)
+    pairs = _load_subject_terms(subject)
+    # 1) 核心保底词（按关键词精确→包含最短匹配，去重置顶）
+    must_keys = _GUIDE_MUST.get(subject, [])
+    picked = []
+    for key in must_keys:
+        hit = None
+        for t, v, ch in pairs:
+            if t == key:
+                hit = t
+                break
+        if hit is None:
+            best = [t for t, v, ch in pairs if key in t]
+            if best:
+                hit = min(best, key=len)
+        if hit and hit not in picked:
+            picked.append(hit)
+    # 2) 其余名额：按章节分组（章内 wiki 优先、稳定排序），轮转采样补足
+    groups = {}
+    order = []
+    for t, v, ch in pairs:
+        if not (2 <= len(t) <= 6):
+            continue
+        if t in picked:
+            continue
+        if ch not in groups:
+            groups[ch] = []
+            order.append(ch)
+        groups[ch].append((t, v))
+    for ch in order:
+        groups[ch].sort(key=lambda x: 0 if x[1] == "wiki" else 1)
+    idxs = {ch: 0 for ch in order}
+    while len(picked) < max_n:
+        progressed = False
+        for ch in order:
+            arr = groups[ch]
+            j = idxs[ch]
+            if j < len(arr):
+                picked.append(arr[j][0])
+                idxs[ch] = j + 1
+                progressed = True
+                if len(picked) >= max_n:
+                    break
+        if not progressed:
+            break
+    txt = ""
+    if picked:
+        txt = (
+            "本课可能涉及以下标准术语。语音转写会把术语写成谐音错字，"
+            "凡读音相近、写法拿不准处，一律按本名单的标准写法书写：\n"
+            + "、".join(picked)
+        )
+    _term_guide_cache[subject] = txt
+    return txt
 
 
 # ---------------- 纪要 + 学科识别 ----------------
@@ -169,6 +292,112 @@ TITLE: 本节课标题
     }
 
 
+# ---- 低信息区清理（2026-09-07 新增）----
+# 背景：老师指着板书/屏幕讲例题时，语音只有碎片指示词与无意义音译（如
+# "关了20V…照着这个IE…rete off fait IЬ insist"），喂给 7B 只会诱导它编造
+# 变量名/方程/数值（伪精确比留白更毒，见电路 09-07 纪要 $IE-IO-I3-I4-I5=0$）。
+# 策略：入纪要 prompt 前先清掉纯口语填充行、把乱码/填充密集区折叠成占位行。
+# 保守设计：只处理带 [hh:mm:ss] 前缀的转写行；乱码需连续 ≥3 行、填充需成片才折叠。
+_FILLER_TOKENS = sorted([
+    "这个", "那个", "然后", "就是", "可以", "我们", "你们", "他们", "大家", "你看",
+    "来看", "看一下", "对不对", "是不是", "怎么样", "是吧", "好吧", "行了", "好的", "对吧",
+    "嗯嗯", "啊啊", "哦哦", "嗯", "哦", "啊", "呃", "哈", "呐", "哎", "嘛", "对", "好",
+    "是", "吧", "吗", "行", "那", "这", "它", "你", "我", "他", "她", "了",
+], key=len, reverse=True)
+
+_TS_RE = re.compile(r"^\[(\d{2}):(\d{2}):(\d{2})\]\s*(.*)$")
+
+
+def _ts_sec(hh: str, mm: str, ss: str) -> int:
+    return int(hh) * 3600 + int(mm) * 60 + int(ss)
+
+
+def _is_filler_line(body: str) -> bool:
+    """整行都是口语填充/语气词（≤8 字）→ True。超过 8 字或含任何实词一律不算（防误伤）。"""
+    b = re.sub(r"[\s，。！？、；：,.!?;:'\"()\[\]·…\-—]", "", body)
+    if not b or len(b) > 8:
+        return False
+    rest = b
+    while rest:
+        hit = next((w for w in _FILLER_TOKENS if rest.startswith(w)), None)
+        if not hit:
+            return False
+        rest = rest[len(hit):]
+    return True
+
+
+def _is_garbled_line(body: str) -> bool:
+    """乱码/无意义音译行：汉字占比过低或夹杂大量字母符号（"rete off fait 工作室 insist"）。
+    排除纯 ASCII 单 token 术语行（Verilog/KCL/PDF）与正常短句（汉字 ≥40%）。"""
+    b = body.strip()
+    if not b:
+        return False
+    han = sum(1 for ch in b if "\u4e00" <= ch <= "\u9fff")
+    if han * 10 >= len(b) * 4:      # 汉字占比 ≥40% → 视为正常行
+        return False
+    if re.fullmatch(r"[A-Za-z0-9_.\-/+]{1,24}", b):   # 纯 ASCII 术语/编号
+        return False
+    letters = sum(1 for ch in b if ch.isascii() and ch.isalpha())
+    return letters >= 2 or han == 0
+
+
+def _collapse_lowinfo(text: str) -> str:
+    """转写文本低信息区清理，返回清理后的文本（供 generate_note 的纪要环节使用，
+    不影响归档的转写原文与知识补全的锚点原文）。"""
+    lines = text.splitlines()
+    out, n = [], len(lines)
+    i = 0
+    while i < n:
+        ln = lines[i]
+        m = _TS_RE.match(ln)
+        if not m:
+            out.append(ln)
+            i += 1
+            continue
+        body = m.group(4).strip()
+        # 1) 乱码密集区（≥3 行连续乱码）→ 折叠占位
+        if _is_garbled_line(body):
+            j, start = i, _ts_sec(*m.group(1, 2, 3))
+            while j < n:
+                mm = _TS_RE.match(lines[j])
+                if not (mm and _is_garbled_line(mm.group(4).strip())):
+                    break
+                j += 1
+            if j - i >= 3:
+                end = _ts_sec(*_TS_RE.match(lines[j - 1]).group(1, 2, 3))
+                dur = max(round((end - start) / 60), 1)
+                out.append(f"[{m.group(1)}:{m.group(2)}:{m.group(3)}]"
+                           f"（此段约 {dur} 分钟为板书/画面讲解或语音不清，题目与过程无法从语音还原，省略不整理）")
+                i = j
+                continue
+            # 不足 3 行的散乱码：原样保留（可能是短术语/编号，宁全勿删）
+            out.append(ln)
+            i += 1
+            continue
+        # 2) 纯填充行：成片（≥6 行）折叠占位，零星则直接删除（无信息）
+        if _is_filler_line(body):
+            j = i
+            while j < n:
+                mm = _TS_RE.match(lines[j])
+                if not (mm and _is_filler_line(mm.group(4).strip())):
+                    break
+                j += 1
+            if j - i >= 6:
+                end = _ts_sec(*_TS_RE.match(lines[j - 1]).group(1, 2, 3))
+                start = _ts_sec(*m.group(1, 2, 3))
+                dur = max(round((end - start) / 60), 1)
+                out.append(f"[{m.group(1)}:{m.group(2)}:{m.group(3)}]"
+                           f"（此段约 {dur} 分钟为口头过渡/寒暄，无实质内容，省略）")
+            i = j
+            continue
+        out.append(ln)
+        i += 1
+    removed = len(lines) - len(out)
+    if removed:
+        print(f"[纪要] 低信息区清理：删除/折叠 {removed} 行（{len(lines)} → {len(out)} 行）", flush=True)
+    return "\n".join(out)
+
+
 def _split_segments(text: str, seg_chars: int = 8000, overlap: int = 1200) -> list:
     """按字符数切段，段间重叠 overlap 字符（避免知识点恰好被切断在边界）。
     8000 字符/段（2026-09-03 调低）：配合 num_ctx=16384 —— 单段 ~8000 字符转写
@@ -208,18 +437,47 @@ SUMMARIZE_REQ = """把课堂录音转写整理成详细的知识点罗列笔记�
 - 课堂问答/互动环节的口语原句（师生对话、提问应答、"这个考不考""要不要记"这类来回）不要原句照搬成条目，要把其中的知识信息提炼成规范表述（如"考试重点：XX"）；去掉问答外壳，保留知识点本身；
 - 数学公式必须用 LaTeX 写在 $...$（行内）或 $$...$$（独立一行）中，方便 Obsidian 渲染；禁止使用 \\[ \\] 或 \\( \\) 分隔符；
 - 术语纠错：本文本来自语音识别，可能存在专业术语谐音误写。同一概念若出现多种写法（如"柔耻原理/柔齿原理/容赤原理"与"容斥原理"并存），统一采用标准学术术语（如"容斥原理"）；明显是术语误写的谐音字（如"单色"实为"单射"、"满色"实为"满射"、"双色"实为"双射"），一律按学科标准术语纠正；
+- 口语过程不转述：老师的口头推理过程、自问自答、寒暄过渡（如"为什么要…呢""我们来看一下""实际上是这样子的""它就会怎么怎么样"）不要逐句转写成条目；只能提炼成有完整结论的知识点。禁止输出"通过某种方式来实现""与…类似""跟…有关系"这类没有结论的空句——每条知识点脱离上下文必须能单独读懂、给出明确结论（定义/公式/性质/结论本身）；
+- 复习内容压缩：若片段开头或中间包含对本课程上一节的复习（如"我们先把上节课的内容复习一下"），复习部分不要按时间线逐句罗列，只提炼成 1~2 条背景知识点（如"复习：上节的 XX 概念/方法"）作为铺垫，把篇幅留给本节课的新内容；新旧知识靠小标题区分，不要混排。
+- 例题/讲题处理（重要）：课堂讲例题时，若语音讲全了题目（已知条件+求解目标都有）→ 整理成完整条目「例：题干…｜方法…｜结论/答案…」，题设里的数字/符号只能来自转写原文，语音没讲到的不得补写；若一段讲题语音只有碎片指示词（"这个""关了 20V""照着这个列"）或明显是老师指着板书/屏幕边讲边比划、语音里没有完整题设 → 该例题整体省略，最多留一句"课上用板书讲解了一道 XX 型例题（题干在板书，未录音）"，禁止编造变量名/方程/数值/答案——凡语音支撑不了的"列出方程…=0""解得…"一律丢弃；
+- 宁缺毋滥：只保留能脱离上下文独立读懂、有明确结论的条目。删掉"老师介绍了/说明了/强调了 XX"却没写出 XX 内容的空句、"本节总结了/讨论了/回顾了…"这类元描述、与前面条目重复的表述；同一主题的内容只允许出现在一个小节，老师换例子重讲/补充时并入已有小节，不得另起小节换标题反复展开；小节标题不要写成课程总标题或与文件名相同的名字。
 
 只输出正文，直接写在 SUMMARY_START 之后、SUMMARY_END 之前，不要输出任何说明文字：
 SUMMARY_START
 SUMMARY_END"""
 
 
-def _summarize_segment(seg: str, meta: dict, part: str) -> str:
-    """整理单个转写片段的知识点草稿（num_predict=4500 防 7B 话痨无限输出卡死）"""
-    prompt = f"{SUMMARIZE_REQ.format(**meta)}\n\n这是本节课第 {part} 部分（全课共若干部分），只整理这一部分的内容。\n\n转写片段：\n{seg}"
+def _summarize_segment(seg: str, meta: dict, part: str, covered: tuple = ()) -> str:
+    """整理单个转写片段的知识点草稿（num_predict=4500 防 7B 话痨无限输出卡死）。
+    covered：此前各段已整理出的小节标题（去重防段间重复：段 2 不知道段 1 写了什么，
+    常把同一概念换措辞再开一节重写，导致最终纪要同主题重复展开）。"""
+    guide = _term_guide(meta.get("subject", ""))
+    guide_blk = f"\n\n{guide}" if guide else ""
+    covered_blk = ""
+    if covered:
+        covered_blk = (
+            "\n\n前面部分已经整理过这些主题（小节标题）：\n"
+            + "、".join(dict.fromkeys(covered))
+            + "\n请勿再为这些主题另起小节重复展开定义/定理；"
+            "若本部分出现同一主题，只写前面没写过的补充内容（新例子、新结论、细节），"
+            "或一句话说明它是复习/强调即可。"
+        )
+    prompt = (
+        f"{SUMMARIZE_REQ.format(**meta)}{guide_blk}{covered_blk}"
+        f"\n\n这是本节课第 {part} 部分（全课共若干部分），只整理这一部分的内容。\n\n转写片段：\n{seg}"
+    )
     raw = ollama_chat(prompt, num_predict=4500)
+    # 2026-09-03 修复：模型输出若无 SUMMARY_END（长输出被 num_predict=4500 截断时常见），
+    # 旧代码 raw[:8000] 会把 "SUMMARY_START" 标记原文一起截进来 → 标记泄漏进正文 + 句子腰斩。
+    # 改为逐级提取：① 有 END → 取 START..END；② 只有 START → 取 START 之后全部（宁全勿简不截断）；
+    # ③ 完全无标记 → 原文直接返回（4500 token 已限长，不会失控）。
     m = re.search(r"SUMMARY_START\s*(.*?)\s*SUMMARY_END", raw, re.S)
-    return m.group(1).strip() if m else raw.strip()[:8000]
+    if m:
+        return m.group(1).strip()
+    idx = raw.find("SUMMARY_START")
+    if idx >= 0:
+        return raw[idx + len("SUMMARY_START"):].strip()
+    return raw.strip()
 
 
 def _draft_sections(text: str):
@@ -228,6 +486,9 @@ def _draft_sections(text: str):
     for ln in text.splitlines():
         s = ln.strip()
         if not s:
+            continue
+        if "SUMMARY_START" in s or "SUMMARY_END" in s:
+            # 防御：模型残留的起止标记行绝不允许进正文（2026-09-03 曾泄漏进"其他"小节）
             continue
         if s.startswith("## "):
             if cur_title is not None or cur_items:
@@ -305,6 +566,24 @@ def _stitch_drafts(drafts: list) -> str:
             merged[title].extend(lines)
     sections = [(t, merged[t]) for t in order]
     sections = _merge_similar_sections(sections)
+    # 2026-09-07：吸收「总结/小结/回顾」类冗余节——7B 常违反"不写综述"在末尾堆一节
+    # 复述前文。处理：与前文条目相似 ≥0.35 的重复条目直接丢弃；确实新增的低相似条目
+    # （如"考试重点"）并入前一小节末尾，不单独立节。
+    _ABSORB_TITLES = ("总结", "小结", "回顾", "综述", "收尾")
+    absorbed = []
+    for t, lines in sections:
+        if any(k in t for k in _ABSORB_TITLES):
+            prev_all = [l for _, ls in absorbed for l in ls]
+            fresh = [l for l in lines
+                     if not any(_text_sim(l, p) >= 0.35 for p in prev_all)]
+            if fresh:
+                if absorbed:
+                    absorbed[-1] = (absorbed[-1][0], absorbed[-1][1] + fresh)
+                else:
+                    absorbed.append((t, fresh))
+            continue
+        absorbed.append((t, lines))
+    sections = absorbed
     out_lines, seen_global = [], set()
     for t, lines in sections:
         out_lines.append(f"## {t}")
@@ -318,6 +597,24 @@ def _stitch_drafts(drafts: list) -> str:
     if loose:
         out_lines.append("## 其他")
         out_lines.extend(_dedup_items(loose))
+    # 2026-09-07 兜底：任何路径残留的起止标记行一律剔除（此前曾泄漏进成品末尾）
+    out_lines = [l for l in out_lines if "SUMMARY_START" not in l and "SUMMARY_END" not in l]
+    # 剔除孤立标题行：小节标题后没有任何条目（7B 输出被截断留下的空节标题）
+    cleaned, pend, pend_has_item = [], None, False
+    for ln in out_lines:
+        if re.match(r"^#{2,4}\s", ln):
+            if pend is not None and pend_has_item:
+                cleaned.append(pend)
+            pend, pend_has_item = ln, False
+        else:
+            if pend is not None:
+                cleaned.append(pend)
+                pend = None
+            pend_has_item = True   # 有非标题行 → 说明此前/当前标题有内容
+            cleaned.append(ln)
+    if pend is not None and pend_has_item:
+        cleaned.append(pend)
+    out_lines = cleaned
     return "\n".join(out_lines).strip() + "\n"
 
 
@@ -326,14 +623,21 @@ def _summarize(full_text: str, meta: dict) -> str:
     策略：整门课转写切段 → 每段独立整理成详细草稿（7B 单轮能力内）→ 程序按小节拼接。
     不用模型做长文合并（7B 输出长文极慢且会把转写原文照抄进输出），
     已有内容由程序拼接保证零丢失，宁全勿简、跨段少量重复可接受。"""
+    full_text = _collapse_lowinfo(full_text)   # 2026-09-07：先清板书碎片/乱码/口语填充，防 7B 编造
     segments = _split_segments(full_text)
     n = len(segments)
     print(f"[纪要] 转写 {len(full_text)} 字符 → 分 {n} 段独立整理 ...", flush=True)
     drafts = []
+    covered: list = []   # 已整理小节标题（喂后续段防同主题重复展开）
     for i, seg in enumerate(segments, start=1):
         t0 = time.time()
-        draft = _summarize_segment(seg, meta, f"{i}/{n}")
+        draft = _summarize_segment(seg, meta, f"{i}/{n}", tuple(covered))
         drafts.append(draft)
+        # 增量收集本段草稿的小节标题（任意 ##/### 层级，供后续段去重参考）
+        for raw_t in re.findall(r"^#{1,4}\s+(.+?)\s*$", draft, re.M):
+            t = re.sub(r"^\d+[.、)）\s]+", "", raw_t).strip()   # 去"1."序号，同主题更好匹配
+            if t and len(t) <= 24 and t not in covered:
+                covered.append(t)
         print(f"[纪要] 段 {i}/{n} 草稿 {len(draft)} 字符 (用时 {time.time()-t0:.0f}s)", flush=True)
     summary = _stitch_drafts(drafts)  # 统一拼接：同名/相似小节归并 + 条目去重
     # 公式分隔符强制转 Obsidian 兼容格式（7B 可能不遵守 prompt 的 $$ 要求，这里兜底强制）

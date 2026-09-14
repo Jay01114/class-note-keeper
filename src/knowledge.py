@@ -197,6 +197,11 @@ def patch_items(full_text: str, meta: dict, note_md: str, skel: list) -> list:
     prompt = PATCH_PROMPT.format(
         subject=meta["subject"], course=meta["course"], title=meta["title"],
         max_sent=MAX_SENTENCES, excerpt=excerpt, note_md=note_md[:8000], skel_json=skel_json)
+    guide = core._term_guide(meta.get("subject", ""))
+    if guide:
+        # 术语锚点注入（2026-09-03）：补全内容要写标准定义/公式，术语必须按标准写法，
+        # 仅作为书写规范参考，不改变任务与 JSON 格式
+        prompt += "\n\n" + guide + "\n（以上仅为本课标准术语写法参考，任务与输出格式不变）"
     raw = _chat(prompt)
     data = _extract_json(raw)
     if isinstance(data, list):          # 模型可能直接输出数组
