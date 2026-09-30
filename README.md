@@ -1,5 +1,7 @@
 # 课堂笔记管家 (ClassNote Keeper)
 
+> 当前发布版本：**3.0**（2026-09-30）
+
 > 手机录音 → 自动转写 → AI 纪要 → 按学科归档进 Obsidian 的**半自动化课堂笔记流水线**。
 > 全部本地运行，永久免费，无需联网（除首次下载模型）。
 
@@ -66,7 +68,11 @@ opensource/
 ├── src/
 │   ├── core.py          # 核心流水线：转写 / 分段纪要 / 术语纠错 / 归档 / 去重 / 监视
 │   ├── knowledge.py     # 知识补全：7B 提取骨架 → 维基查证 → [补] 写回
+│   ├── rerun_note.py    # 纪要重跑工具：改 prompt/术语表后，不重新转写即可重出纪要
 │   └── app.py           # PySide6 桌面界面：任务列表 / 进度条 / 日志 / 托盘
+├── tests/
+│   ├── test_archive_merge.py  # 归档原子性 / 防覆盖 / 小节归并 / 术语纠错（50 项）
+│   └── test_gpu_ready.py      # Ollama GPU discovery 竞态回归（8 项）
 ├── docs/
 │   ├── architecture.md  # 架构与数据流详解
 │   ├── setup-guide.md   # 从零搭建指南（模型下载、配置、运行）
@@ -91,6 +97,7 @@ ollama pull qwen2.5:7b
 
 # 4. 配置
 cp config.example.json config.json   # 按需修改路径与学科列表
+#    若跳过此步也能启动：程序会自动回退到 config.example.json
 
 # 5. 运行
 python src/app.py
@@ -98,12 +105,27 @@ python src/app.py
 
 > 本仓库提供的是**工作流与代码**，不捆绑任何商业软件包；Ollama、模型等一律从官方渠道安装。
 
-## 硬件与资源（实测：RTX 5060 8GB）
+### 路径说明（可移植）
 
-- 转写：medium 档，2 小时录音约 5~10 分钟，显存约 1.5~2.5GB
-- 纪要：Qwen2.5-7B，单条约 1 分钟，显存约 4.7GB
-- 串行执行，峰值显存约 5GB，8GB 显存安全
+程序不依赖任何固定盘符或绝对路径，启动时按以下顺序定位 `config.json`：
+
+1. 环境变量 `CNK_ROOT` 指向的目录（可选，用于便携版 / 多实例）
+2. 程序根目录（源码运行时为仓库根；打包运行时为 exe 所在目录）
+3. `src/` 同目录（打包内模板）
+4. 都没有则回退 `config.example.json`（首次运行不会因缺配置崩溃）
+
+`config.json` 里的 `inbox_dir` / `vault_dir` / `models_dir` 支持相对路径（如 `./inbox`），
+也可写绝对路径。整个文件夹换机器、换盘、改名后无需改动代码。
+
+## 硬件与资源（实测：RTX 5060 Laptop 8GB）
+
+- 转写：**large-v3** 档（medium 实测质量不够），78 分钟录音约 7 分钟，**约 11× 实时**
+- 纪要：Qwen2.5-7B，分 6 段独立整理，单课约 1.5~3 分钟，显存约 5.5GB
+- 串行执行（转写完先释放显存再跑纪要），峰值显存约 5.5GB，8GB 显存安全
 - 空闲不处理时：内存 < 200MB，GPU 0 占用
+
+> ⚠️ **8GB 显存的坑**：large-v3 和 7B 不能同时驻留显存。本项目在转写结束后立即
+> `release_whisper()` 释放转写显存，再启动纪要阶段——这也是"转写和纪要串行"的原因。
 
 ## License
 

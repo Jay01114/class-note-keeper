@@ -26,6 +26,9 @@ config.local.json
 *.log
 ollama_debug.log
 
+# 运行时临时目录（调试日志 / 中转文件，不入库）
+tmp/
+
 # 本地模型权重（数百 MB ~ 数 GB，走 HuggingFace 下载，不入库）
 models/
 

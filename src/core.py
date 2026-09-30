@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""课堂笔记管家 · 核心流水线
+"""课堂笔记管家 · 核心流水线（M1 命令行版）
 流程: 监视 inbox -> 新音频入队 -> faster-whisper 转写 -> Qwen 纪要+识别学科课名 -> 写入 Obsidian vault
 用法: python core.py  （启动后常驻监视，Ctrl+C 退出；启动时先处理 inbox 已有文件）
 """
@@ -30,20 +30,59 @@ import json5
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-# 配置文件定位：环境变量 KETANG_CONFIG 最高优先，其次当前目录/脚本同级/仓库根的 config.json
+def _app_root() -> Path:
+    """定位产品根目录（config/vault/inbox/models 所在层，仅作**兜底**用）。
+
+    注意：正常运行时 inbox/vault/models 的实际路径一律读 config.json 的
+    inbox_dir/vault_dir/models_dir，本函数只在 config 缺失或未设该键时兜底。
+
+    层级（2026-09-17 实测）：
+    - 源码运行：core.py 在 {root}/app/            → 上溯 1 层 = root
+    - 打包运行：exe 在 {root}/课堂笔记管家/        → 上溯 1 层 = root
+      （PyInstaller COLLECT 会把 exe 放进同名子目录，所以是 parent 而非 parent.parent）
+    - 用户可用环境变量 CNK_ROOT 强制覆盖（便携/多实例）
+
+    2026-09-17：原实现把配置路径硬编码为某个固定盘符下的绝对路径，
+    换机器 / 换盘 / 改文件夹名后启动即失败；现改为按上述层级自动定位。
+    若既没有 config.json 也没有 config.example.json，会在 import 阶段报错——
+    这是刻意为之：配置文件缺失属于部署错误，应尽早暴露。
+    """
+    env = os.environ.get("CNK_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env)
+    if getattr(sys, "frozen", False):
+        # exe 所在目录；若该目录没有 config.json（例如直接用 dist/ 下的 exe），
+        # 再上溯一层找（兼容 {root}/{app}/exe 与 {root}/exe 两种布局）
+        here = Path(sys.executable).resolve().parent
+        if (here / "config.json").exists():
+            return here
+        if (here.parent / "config.json").exists():
+            return here.parent
+        return here
+    return Path(__file__).resolve().parent.parent
+
+
 CONFIG_PATH = None
-_env_cfg = os.environ.get("KETANG_CONFIG", "")
-for _cand in [
-    Path(_env_cfg) if _env_cfg else None,             # 环境变量指定（最高优先）
-    Path.cwd() / "config.json",                       # 当前目录（如在项目根运行 python）
-    Path(__file__).parent / "config.json",            # 脚本同级（src/config.json）
-    Path(__file__).parent.parent / "config.json",     # 仓库根（config.json）
-]:
-    if _cand and _cand.exists():
+_APP_ROOT = _app_root()
+
+# 依次尝试的候选位置（按优先级）。_app_root() 覆盖源码运行与打包运行两种布局；
+# 后面两个是兜底：core.py 与 config.json 同目录（打包进 exe 内置模板）、或仓库根目录。
+for _base in (_APP_ROOT, Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent):
+    _cand = _base / "config.json"
+    if _cand.exists():
         CONFIG_PATH = _cand
         break
 if CONFIG_PATH is None:
-    CONFIG_PATH = Path(__file__).parent / "config.json"
+    CONFIG_PATH = _APP_ROOT / "config.json"
+
+# 首次运行（只放源码、还没配 config.json）时用 config.example.json 兜底，
+# 否则 import core 会直接 FileNotFoundError，新用户连启动都看不到提示。
+if not CONFIG_PATH.exists():
+    for _base in (_APP_ROOT, Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent):
+        _ex = _base / "config.example.json"
+        if _ex.exists():
+            CONFIG_PATH = _ex
+            break
 
 
 def load_config():
@@ -84,7 +123,12 @@ def transcribe(path: str) -> str:
     name = Path(path).name
     print(f"[转写] 开始: {name}")
     t0 = time.time()
-    segments, info = model.transcribe(path, language="zh", vad_filter=False)
+    # condition_on_previous_text=False（2026-09-17 根因修复）：
+    # 默认 True 时，文件开头若有一段音乐/片尾音频，会把上下文带偏，
+    # 后续 78 分钟远场安静人声触发幻觉循环（每 30s 复读一句片尾词）。
+    # 实测关闭后同一文件转出 1842 段正常课程内容（avg_logprob mean=-0.18）。
+    segments, info = model.transcribe(path, language="zh", vad_filter=False,
+                                      condition_on_previous_text=False)
     lines = []
     for seg in segments:
         h, m, s = int(seg.start // 3600), int(seg.start % 3600 // 60), int(seg.start % 60)
@@ -245,6 +289,22 @@ def _term_guide(subject: str) -> str:
 
 
 # ---------------- 纪要 + 学科识别 ----------------
+# 瞬时失败重试（2026-09-17 新增）：llama-server 在长 prompt + 多段连续调用下会
+# 间歇性返回 HTTP 500（实测同一段重放即 200），旧代码 raise_for_status() 直接抛出，
+# 导致「1 段瞬时 500 → 整课 6 段全部作废」。下面按退避重试，且每次重试前探活。
+OLLAMA_RETRIES = 4          # 首次 + 3 次重试
+OLLAMA_BACKOFF = (2, 5, 10)  # 退避秒数
+
+
+def _ollama_alive(timeout: float = 3.0) -> bool:
+    """探活 /api/tags：区分「服务没起来」和「单次请求偶发 500」。"""
+    try:
+        r = requests.get(CFG["ollama_host"] + "/api/tags", timeout=timeout)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def ollama_chat(prompt: str, num_predict: int = None) -> str:
     url = CFG["ollama_host"] + "/api/chat"
     # num_ctx=16384（2026-09-03 调低）：7B Q4 显存账 4.7GB + 16k ctx KV ~1.3GB + CUDA 开销
@@ -259,9 +319,32 @@ def ollama_chat(prompt: str, num_predict: int = None) -> str:
         "stream": False,
         "options": options,
     }
-    r = requests.post(url, json=payload, timeout=1800)
-    r.raise_for_status()
-    return r.json()["message"]["content"]
+    last_err = None
+    for attempt in range(OLLAMA_RETRIES):
+        if attempt:
+            wait = OLLAMA_BACKOFF[min(attempt - 1, len(OLLAMA_BACKOFF) - 1)]
+            print(f"[纪要] 请求失败（{last_err}），{wait}s 后重试 {attempt}/{OLLAMA_RETRIES - 1} ...", flush=True)
+            time.sleep(wait)
+            if not _ollama_alive():
+                # 服务真没了：再等一轮（Ollama 会自己重启 runner），但别把自己拖死
+                time.sleep(5)
+        try:
+            r = requests.post(url, json=payload, timeout=1800)
+            if r.status_code >= 500:
+                # 5xx = 服务端瞬时故障（runner 重启/上下文槽位回收），可重试
+                last_err = f"HTTP {r.status_code}"
+                continue
+            r.raise_for_status()
+            return r.json()["message"]["content"]
+        except requests.exceptions.HTTPError as e:
+            # 4xx（如模型不存在）重试无意义，直接抛出
+            raise
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+                ValueError) as e:
+            last_err = type(e).__name__
+    raise RuntimeError(f"Ollama 连续 {OLLAMA_RETRIES} 次请求失败（最后错误：{last_err}）")
 
 
 def _classify(full_text: str) -> dict:
@@ -285,11 +368,76 @@ TITLE: 本节课标题
     m_c = re.search(r"COURSE:\s*(.+)", raw)
     m_t = re.search(r"TITLE:\s*(.+)", raw)
     subject = normalize_subject(m_s.group(1).strip() if m_s else "")
-    return {
-        "subject": subject,
-        "course": (m_c.group(1).strip() if m_c else subject),
-        "title": (m_t.group(1).strip() if m_t else "未命名课程"),
-    }
+    course = m_c.group(1).strip() if m_c else subject
+    title = m_t.group(1).strip() if m_t else "未命名课程"
+
+    # 关键词投票纠偏（见 _subject_vote 注释）
+    voted, top_n, second_n = _subject_vote(full_text)
+    if voted and voted != subject and top_n >= _SUBJECT_VOTE_MIN and \
+            top_n >= _SUBJECT_VOTE_RATIO * max(second_n, 1):
+        print(f"[纪要] 学科关键词投票纠偏：{subject} → {voted}（{top_n} 票 vs 次高 {second_n} 票）")
+        subject = voted
+        # 模型顺着错误学科编的课程名必须一起丢弃（如「数字逻辑与密码学基础」）
+        course = voted
+
+    return {"subject": subject, "course": course, "title": title}
+
+
+# ---- 学科关键词投票（2026-09-16 新增）----
+# 背景：7B 分类对某些课程有稳定偏见，不是随机抽风。实测 09-16「费马小定理与欧拉定理」
+# （纯数论，应属离散数学）连跑 3 次都判成「数字逻辑和计算机组成」，且改成
+# 「开头+中段+尾段」三段采样仍然判错 —— 说明是模型偏见，不是信息量不足，喂更多文本没用。
+# 对策：用一份「学科专属特征词」表对全文投票，票数压倒性时直接覆盖模型结论。
+# 只收各科高专有度词（「费马小定理」「卡诺图」），不收「逻辑」「证明」这类跨科词，
+# 避免误伤。实测：vault 内 20 门历史课程全部判对（零误伤），09-16 给出 88:0。
+_SUBJECT_VOTE_MIN = 5      # 最高票下限：太低说明该课不在词表覆盖范围，交回模型判断
+_SUBJECT_VOTE_RATIO = 3    # 最高票须≥次高票 3 倍，否则视为有歧义、不覆盖
+
+_SUBJECT_KEYWORDS = {
+    "离散数学": [
+        "费马小定理", "欧拉定理", "欧拉函数", "同余", "模运算", "素数", "质数", "互质",
+        "整除", "约数", "最大公因数", "最小公倍数", "容斥原理", "数学归纳法", "鸽巢原理",
+        "拉姆齐", "布尔格", "偏序", "等价关系", "斯特林数", "生成函数", "递推关系",
+        "图论", "哈密顿", "欧拉回路", "二项式", "排列组合", "抽屉原理", "唯一分解",
+        "强归纳法", "反链", "极大链", "素因子", "合数", "整除性",
+    ],
+    "数字逻辑和计算机组成": [
+        "卡诺图", "真值表", "逻辑门", "与门", "或门", "非门", "异或门", "同或门",
+        "触发器", "寄存器", "多路选择器", "译码器", "编码器", "加法器", "计数器",
+        "时序逻辑", "组合逻辑", "最小项", "最大项", "布尔代数", "原码", "反码",
+        "补码", "数制", "十六进制", "Verilog", "冯诺依曼", "指令周期", "格雷码",
+        "奇偶校验", "选择器", "锁存器", "全加器", "半加器", "状态机",
+    ],
+    "概率论": [
+        "随机变量", "概率密度", "分布函数", "期望", "方差", "协方差", "条件概率", "贝叶斯",
+        "全概率", "独立同分布", "正态分布", "泊松", "几何分布", "二项分布", "均匀分布",
+        "大数定律", "中心极限定理", "假设检验", "样本空间", "互斥", "古典概型", "几何概型",
+        "分布律", "无记忆性", "相关系数", "边缘分布", "联合分布", "置信区间",
+    ],
+    "电路、信号和系统": [
+        "基尔霍夫", "欧姆定律", "节点分析", "网孔", "戴维南", "诺顿", "叠加定理",
+        "电容", "电感", "阻抗", "谐振", "滤波器", "傅里叶", "拉普拉斯", "Z变换",
+        "卷积", "采样定理", "相量", "功率因数", "最大功率传输", "受控源", "运算放大器",
+        "受控电源", "电流源", "电压源", "回路电流", "电路分析", "信号处理", "频谱",
+    ],
+}
+
+
+def _subject_vote(text: str) -> tuple:
+    """按学科专属特征词对全文投票，返回 (学科, 最高票, 次高票)。全零返回 (None, 0, 0)。
+
+    用全文而非开头截断段：偏见的成因之一正是只看开头，全文投票信号强得多。
+    """
+    try:
+        scores = {s: sum(text.count(k) for k in ks) for s, ks in _SUBJECT_KEYWORDS.items()}
+    except Exception:
+        return None, 0, 0
+    ranked = sorted(scores.items(), key=lambda x: -x[1])
+    if not ranked or ranked[0][1] <= 0:
+        return None, 0, 0
+    top, top_n = ranked[0]
+    second_n = ranked[1][1] if len(ranked) > 1 else 0
+    return top, top_n, second_n
 
 
 # ---- 低信息区清理（2026-09-07 新增）----
@@ -431,7 +579,18 @@ SUMMARIZE_REQ = """把课堂录音转写整理成详细的知识点罗列笔记�
 - 把课堂内容逐条整理成知识点，宁全勿简：定义、概念、公式、定律、性质、例子、数据、要求、注意事项都尽量保留；
 - 篇幅：尽量详尽，转写片段较长时目标 1500-3000 字符，覆盖片段内出现的所有知识点，不要只写梗概；
 - 删除口语废话和课堂套话（"同学们好""我们来看""那么""好的""下课"等寒暄连接词），但知识点信息本身要完整；
-- 按主题分小节（## 开头），每条知识点用 - 开头；
+- **必须分小节（硬性要求）**：每个小节以 `## ` 开头单独一行，小节内每条知识点用 `- ` 开头。
+  正文里**不允许出现不属于任何小节的 `- ` 条目**——第一条 `- ` 之前必须先有一个 `## ` 标题行。
+  正确示例：
+  ## 主从D触发器的结构
+  - 由两个D锁存器串联构成，主级和从级由同一个 CLK 控制。
+  - 主级在 CLK=0 时跟随输入 D。
+  ## 建立时间与保持时间
+  - 建立时间：CLK 边沿到来前，D 必须保持稳定的最短时间。
+  错误示例（不允许）：
+  - 两个D锁存器串联构成主从结构。
+  - 主级在 CLK=0 时跟随输入 D。
+  （上面这种「只有条目、没有 ## 标题」的输出视为不合格）
 - 直接从第一个小节开始组织，不要先输出总览/要点列表再重复展开，每个知识点只出现一次；
 - 不要写成概括性总结，不要写"本节课主要讲述了…"这类综述，不要写客套结束语。
 - 课堂问答/互动环节的口语原句（师生对话、提问应答、"这个考不考""要不要记"这类来回）不要原句照搬成条目，要把其中的知识信息提炼成规范表述（如"考试重点：XX"）；去掉问答外壳，保留知识点本身；
@@ -473,15 +632,89 @@ def _summarize_segment(seg: str, meta: dict, part: str, covered: tuple = ()) -> 
     # ③ 完全无标记 → 原文直接返回（4500 token 已限长，不会失控）。
     m = re.search(r"SUMMARY_START\s*(.*?)\s*SUMMARY_END", raw, re.S)
     if m:
-        return m.group(1).strip()
-    idx = raw.find("SUMMARY_START")
-    if idx >= 0:
-        return raw[idx + len("SUMMARY_START"):].strip()
-    return raw.strip()
+        body = m.group(1).strip()
+    else:
+        idx = raw.find("SUMMARY_START")
+        body = raw[idx + len("SUMMARY_START"):].strip() if idx >= 0 else raw.strip()
+
+    # 2026-09-18：整段一个 ## 标题都没有 → 判定为不合格草稿。
+    # 直接流向下游会被 _draft_sections 收进兜底块，最终纪要先出现一大坨无标题流水
+    # （09-17 实测：45 条知识点挤在一起，标题还和内容对不上）。
+    # 这里做一次**只补结构、不重写内容**的定向重试：把已有条目原样保留，
+    # 只要求模型插小标题；重试仍失败就接受（兜底块接管，不会丢内容）。
+    if body and len(body) >= 400 and not re.search(r"^#{1,4}\s+\S", body, re.M):
+        try:
+            fixed = ollama_chat(
+                "下面是一份课堂笔记草稿，内容已经写好，但**缺少小标题**。\n"
+                "请只做一件事：把它按主题切成若干小节，给每个小节加一行 `## 小标题`。\n"
+                "硬性要求：\n"
+                "- **不得修改、删减、合并、改写任何一条 `- ` 条目**，必须逐条原样保留（含标点）；\n"
+                "- 不得新增任何条目，不得补写原文没有的内容；\n"
+                "- 只允许插入 `## ` 标题行和调整条目归属；\n"
+                "- 标题要具体（写清是什么电路/什么概念），不要写课程名或「知识回顾」这类空标题。\n"
+                "- 直接输出整理后的全文，不要任何说明。\n\n"
+                f"草稿：\n{body}",
+                num_predict=4500,
+            )
+            m2 = re.search(r"SUMMARY_START\s*(.*?)\s*SUMMARY_END", fixed, re.S)
+            f2 = m2.group(1).strip() if m2 else fixed.strip()
+            # 只在真的补出了标题、且条目数没被砍（>=90%）时才采纳
+            orig_n = body.count("\n- ") + (1 if body.startswith("- ") else 0)
+            new_n = f2.count("\n- ") + (1 if f2.startswith("- ") else 0)
+            if re.search(r"^#{1,4}\s+\S", f2, re.M) and new_n >= orig_n * 0.9:
+                print(f"[整理] 第 {part} 部分原缺小标题，已定向补结构")
+                return f2
+        except Exception as e:
+            print(f"[整理] 第 {part} 部分补结构失败（忽略，用兜底块）: {e}")
+    return body
 
 
-def _draft_sections(text: str):
-    """把一段草稿解析成 [(小节标题, [行]), ...]，无标题散行归入 None 标题"""
+# 无标题散行兜底成多少条一节：7B 整段不给标题时（2026-09-18 实测），
+# 若全塞进一个 None 桶会拼成一坨大杂烩；按 8 条切块并配上可追溯标题，
+# 至少让结构可读、内容不丢，且用户一眼能看出这段是模型没给标题。
+_ORPHAN_CHUNK = 8
+
+
+def _orphan_sections(lines: list, part: str = "") -> list:
+    """把无标题散行切成若干块，每块给一个可追溯的兜底标题。
+
+    标题形如「（未分节内容 · 第2块）」——刻意保留「未分节」字样作为诊断信号，
+    方便事后 grep 出哪些课触发了这个降级路径。"""
+    lines = [l for l in lines if l.strip()]
+    if not lines:
+        return []
+    out = []
+    total = (len(lines) + _ORPHAN_CHUNK - 1) // _ORPHAN_CHUNK
+    for i in range(0, len(lines), _ORPHAN_CHUNK):
+        chunk = lines[i:i + _ORPHAN_CHUNK]
+        n = i // _ORPHAN_CHUNK + 1
+        title = "未分节内容"
+        if total > 1:
+            title += f" · 第{n}块"
+        if part:
+            title += f"（源自{part}）"
+        out.append((title, chunk))
+    return out
+
+
+def _draft_sections(text: str, part: str = ""):
+    """把一段草稿解析成 [(小节标题, [行]), ...]，无标题散行归入 None 标题。
+
+    2026-09-17 修复：原实现只认 `## `（恰好两个井号）和 `# `（单井号），
+    把 `### ` / `#### ` 当普通内容行吞进条目列表 —— 7B 若整段用三级标题分节
+    （实测 09-17 重跑第 1 段如此），该段的全部小节都会塞进一个 None 桶，
+    标题以字面文本留在正文里，_stitch_drafts 再把它当散行拼到别处，
+    造成「标题与内容错位」。现统一认 `#{1,4}`，与 _summarize 收集 covered
+    标题用的正则 `^#{1,4}\\s+` 保持一致。"""
+    # 解析：遇到标题就开新节。
+    # 2026-09-18：无标题散行不再以 None 形式流向下游。下游 _stitch_drafts 会把 None
+    # 当"散行"拼到纪要开头 → 标题与内容错位 + 结构塌缩（09-17 实测：45 条知识点挤在
+    # 一起、标题与内容对不上）。现改为切成带兜底标题的小节：结构可读、内容不丢，
+    # 且「模型没给标题」显式暴露（标题含"未分节"，便于事后 grep 统计触发率）。
+    #
+    # 关键点：「标题 → 散行 → 标题」中间的散行，语义上属于**前一个标题**（模型只是
+    # 忘了再给一个小标题），不是"整段无标题"。所以这里沿用原有归属逻辑，把散行留在
+    # 当前节内；只有"整段从头到尾没有任何标题"时才是真正的无标题草稿，走兜底切块。
     sections, cur_title, cur_items = [], None, []
     for ln in text.splitlines():
         s = ln.strip()
@@ -490,20 +723,29 @@ def _draft_sections(text: str):
         if "SUMMARY_START" in s or "SUMMARY_END" in s:
             # 防御：模型残留的起止标记行绝不允许进正文（2026-09-03 曾泄漏进"其他"小节）
             continue
-        if s.startswith("## "):
+        m = re.match(r"^(#{1,4})\s+(.+)$", s)
+        if m:
             if cur_title is not None or cur_items:
                 sections.append((cur_title, cur_items))
-            cur_title, cur_items = s[3:].strip(), []
-        elif s.startswith("# "):
-            # 单井号也当小节标题（部分模型习惯用 #）
-            if cur_title is not None or cur_items:
-                sections.append((cur_title, cur_items))
-            cur_title, cur_items = s[2:].strip(), []
+            cur_title, cur_items = m.group(2).strip(), []
         else:
             cur_items.append(s)  # - 条目/公式行/表格行等一律按原样保留，不丢内容
     if cur_title is not None or cur_items:
         sections.append((cur_title, cur_items))
-    return sections
+
+    if any(t for t, _ in sections):
+        # 有至少一个标题：散行（None 桶）只可能出现在最前面（正文开头的导语），
+        # 用兜底块收容；其余保持"归入当前节"的既有语义不变。
+        return [
+            (t, items) if t else (f"未分节内容（源自{part}）" if part else "未分节内容", items)
+            for t, items in sections
+        ]
+
+    # 整段一个标题都没有：切成多块兜底，避免堆成一坨大杂烩
+    flat = []
+    for _, items in sections:
+        flat.extend(items)
+    return _orphan_sections(flat, part)
 
 
 def _text_sim(a: str, b: str) -> float:
@@ -529,10 +771,59 @@ def _dedup_items(items: list) -> list:
     return out
 
 
+# 2026-09-17：0.45 阈值实测把 09-17 课压成 4 个小节（历史均值 12.8）。
+# 7B 对同一阶段会输出「D触发器的工作原理」「D触发器的工作过程」这类泛化小标题，
+# 彼此内容相似度天然落在 0.5~0.7，0.45 一网打尽 → 结构塌缩。
+# 提到 0.60：仍能吃掉「同标题近重复」（>0.7）与真正复述（>0.85），
+# 泛化小标题因内容各有侧重而被保留。复述兜底交给 _dedup_items（0.85 条目级）。
+_SECTION_MERGE_SIM = 0.60
+
+# 2026-09-18：0.60 单阈值放过了「同义标题」小节——7B 常把同一主题写成
+# 「边沿敏感触发器」「边沿敏感触发器与电平敏感触发器的区别」
+# 「电平敏感触发器与边沿敏感触发器的区别」三节（内容各有侧重 → 相似度仅 0.5 上下）。
+# 这里的判定不看内容、只看标题：剥掉虚词后词集高度重合即为同义主题，
+# 此时阈值放宽到 0.35（内容再怎么侧重，也确实是同一块知识）。
+_TITLE_STOP = ("与", "和", "的", "及", "以及", "区别", "对比", "比较",
+               "原理", "概念", "介绍", "功能", "实现", "设计", "方法",
+               "关系", "作用", "应用", "分析")
+
+
+def _title_core(title: str) -> str:
+    """剥掉标点与虚词，得到用于同义判定的标题主干（纯字符串处理，无副作用）"""
+    t = re.sub(r"[，,、（）()\[\]【】:：;；!！?？\"'“”‘’\s]+", "", title or "")
+    for w in _TITLE_STOP:
+        t = t.replace(w, "")
+    return t
+
+
+def _title_similar(a: str, b: str) -> bool:
+    """判断两个小节标题是否指向同一主题。
+
+    判定用「主干相同或互为子串」+ 「词集相同（语序无关）」，
+    不接受纯相似度兜底 —— 相似度会把「泛化标题A」和「泛化标题B」
+    这类只差末尾一个字母的不同主题判成同义（2026-09-18 回归测试实测）。
+
+    另外要求：短主干（≤4 字）只允许完全相等，防止「寄存器」吃掉一切。"""
+    ca, cb = _title_core(a), _title_core(b)
+    if not ca or not cb:
+        return False
+    if ca == cb:
+        return True
+    # 主干很短时不做包含判断（「寄存器」是「环形计数器」的子串但不该合并）
+    if len(ca) <= 4 or len(cb) <= 4:
+        return False
+    if ca in cb or cb in ca:
+        return True
+    # 语序无关的字频对比：词集完全相同 → 同义（A与B / B与A）
+    return sorted(ca) == sorted(cb)
+
+
 def _merge_similar_sections(sections: list) -> list:
-    """小节级相似归并：标题不同但内容高度相似（相似度 ≥0.45）的小节合并为一个。
-    解决 7B 用多个小节标题反复展开同一内容（如"对角线论证方法"连写多节几乎相同）。
-    保留先出现的标题；并入小节中与已有内容不重复的条目。"""
+    """小节级相似归并：标题不同但内容高度相似（相似度 ≥0.60）的小节合并为一个。
+    解决 7B 用多个小节标题反复展开同一内容（如"康诺对角线论证方法"连写 4 节几乎相同）。
+    保留先出现的标题；并入小节中与已有内容不重复的条目。
+    2026-09-17 防塌缩：①阈值 0.45→0.60；②两边条目都不足 2 条时不合并
+    （防止 1~2 条「补：…」小节的相似度恰好落在阈值上被误并）；③同名小节不合并。"""
     result = []
     for title, lines in sections:
         if not lines:
@@ -540,7 +831,23 @@ def _merge_similar_sections(sections: list) -> list:
         text = "\n".join(lines)
         done = False
         for i, (rt, rlines) in enumerate(result):
-            if not done and _text_sim(text, "\n".join(rlines)) >= 0.45:
+            if rt == title:            # 同名由 _stitch_drafts 的 merged 阶段合并，这里不碰
+                continue
+            if len(lines) < 2 or len(rlines) < 2:
+                continue
+            # 2026-09-18：同义标题直接归并，不再看内容相似度。
+            # 依据：标题（剥虚词后）指向同一主题，就是同一块知识——7B 常把
+            # 「边沿敏感触发器」拆成「…与电平敏感触发器的区别」正反两节，
+            # 两节内容天然互补（各写一半），相似度只有 0.2 上下，
+            # 若还按内容阈值判就永远合不掉 → 主题碎裂。
+            # 反向风险（误并真不同主题）已由 _title_similar 的
+            # 「主干互为子串 + 短主干不兜底」约束住。
+            if _title_similar(title, rt):
+                thr = 0.0
+            else:
+                thr = _SECTION_MERGE_SIM
+            sim = _text_sim(text, "\n".join(rlines))
+            if not done and sim >= thr:
                 keep = [l for l in lines
                         if not any(_text_sim(l, rl) >= 0.85 for rl in rlines)]
                 if keep:
@@ -551,20 +858,65 @@ def _merge_similar_sections(sections: list) -> list:
     return result
 
 
+def _merge_same_title_head(sections: list) -> list:
+    """把「标题与课程同名」的小节并入紧随其后的首个小节。
+    2026-09-17 新增：prompt 明确禁止「小节标题不要写成课程总标题」，但 7B 仍会
+    以 `## D触发器及其边沿敏感触发器设计` 开头（等于把小节标题写成文件名），
+    导致同一主题两个小节。同名节通常是承接性开头（定义/符号），并入下一节顺序不变、
+    内容零丢失。只在标题长度 ≥4 且非"其他"时生效，避免误伤。
+
+    实现用 pending 缓冲而非直接 append：命中「总标题节」后先暂存，等遇到第一个
+    非总标题节再一次性落成 (下一节标题, 总标题节内容 + 下一节内容)，
+    否则会先 push 一个同名条目、后续无法再并入（首版 bug）。"""
+    course_title = (CFG.get("_last_course_title") or "").strip()
+    if not course_title:
+        return list(sections)
+    out: list = []
+    pending: list = []   # 待并入下一节的「总标题节」内容
+    for t, lines in sections:
+        is_head = bool(t) and len(t) >= 4 and t != "其他" and t == course_title
+        if is_head:
+            pending.extend(lines)
+            continue
+        if pending:
+            # 落后一节：总标题节内容 + 本节内容合并到本节标题下
+            out.append((t, pending + list(lines)))
+            pending = []
+        else:
+            out.append((t, lines))
+    if pending:
+        # 文件末尾只有总标题节（无后继节）→ 单独成节，不丢内容
+        out.append((course_title, pending))
+    return out
+
+
+_META_ITEM_PAT = re.compile(
+    r"(课上用板书|题干在板书|未录音|"
+    r"下(周|次|节|节课)[一二三四五六日]?(将|要)?(讨论|讲|学|做|上)|"
+    r"为下(周|次|节)[一二三四五六日]?.{0,6}(实验|课|考试)做准备|"
+    r"本节课(就)?(讲到这里|结束)|休息一下|课间休息)"
+)
+
+
+def _is_meta_item(line: str) -> bool:
+    """判断一条目是否为课堂事务性元信息（非知识点）。"""
+    return bool(_META_ITEM_PAT.search(line or ""))
+
+
 def _stitch_drafts(drafts: list) -> str:
     """程序拼接多段独立草稿：同名小节内容归并 + 小节级相似归并 + 条目级去重。
     宁全勿简、内容零丢失（重复由程序消除），返回整门课完整纪要正文。"""
-    merged, order, loose = {}, [], []
-    for d in drafts:
-        for title, lines in _draft_sections(d):
-            if title is None:
-                loose.extend(lines)
-                continue
+    merged, order = {}, []
+    # 2026-09-18：_draft_sections 现接收 part 标签用于兜底标题可追溯（「未分节内容（源自第2段）」）。
+    # 传段号而非变量名 part（此前误传未定义变量导致 NameError）。
+    for i, d in enumerate(drafts, 1):
+        for title, lines in _draft_sections(d, f"第{i}段"):
             if title not in merged:
                 merged[title] = []
                 order.append(title)
             merged[title].extend(lines)
     sections = [(t, merged[t]) for t in order]
+    sections = _merge_same_title_head(sections)
     sections = _merge_similar_sections(sections)
     # 2026-09-07：吸收「总结/小结/回顾」类冗余节——7B 常违反"不写综述"在末尾堆一节
     # 复述前文。处理：与前文条目相似 ≥0.35 的重复条目直接丢弃；确实新增的低相似条目
@@ -584,6 +936,12 @@ def _stitch_drafts(drafts: list) -> str:
             continue
         absorbed.append((t, lines))
     sections = absorbed
+    # 2026-09-18：剔除课堂事务性元信息——7B 会把「课上用板书讲解了一道…例题
+    # （题干在板书，未录音）」「介绍下周二将讨论的内容」「为下周四的实验做准备」
+    # 当作知识点写进纪要。这类不是知识，进复习笔记只会占位干扰。
+    # 命中任一特征即丢弃该条目；整节被剔空则连标题一起丢弃。
+    sections = [(_t, [l for l in ls if not _is_meta_item(l)]) for _t, ls in sections]
+    sections = [(_t, ls) for _t, ls in sections if ls]
     out_lines, seen_global = [], set()
     for t, lines in sections:
         out_lines.append(f"## {t}")
@@ -594,9 +952,6 @@ def _stitch_drafts(drafts: list) -> str:
                     continue
                 seen_global.add(it)
             out_lines.append(it)
-    if loose:
-        out_lines.append("## 其他")
-        out_lines.extend(_dedup_items(loose))
     # 2026-09-07 兜底：任何路径残留的起止标记行一律剔除（此前曾泄漏进成品末尾）
     out_lines = [l for l in out_lines if "SUMMARY_START" not in l and "SUMMARY_END" not in l]
     # 剔除孤立标题行：小节标题后没有任何条目（7B 输出被截断留下的空节标题）
@@ -629,9 +984,18 @@ def _summarize(full_text: str, meta: dict) -> str:
     print(f"[纪要] 转写 {len(full_text)} 字符 → 分 {n} 段独立整理 ...", flush=True)
     drafts = []
     covered: list = []   # 已整理小节标题（喂后续段防同主题重复展开）
+    failed: list = []    # 失败段号（不阻断整体，最后汇总提示）
     for i, seg in enumerate(segments, start=1):
         t0 = time.time()
-        draft = _summarize_segment(seg, meta, f"{i}/{n}", tuple(covered))
+        try:
+            draft = _summarize_segment(seg, meta, f"{i}/{n}", tuple(covered))
+        except Exception as e:
+            # 单段失败不放弃整课（2026-09-17）：重试已在 ollama_chat 内做过，
+            # 到这里说明该段确实反复失败。跳过该段继续后续段，最后如实报告缺口，
+            # 避免「段 5 挂了 → 前 4 段成果全丢」。
+            failed.append(i)
+            print(f"[纪要] 段 {i}/{n} 整理失败（已重试）：{e}", flush=True)
+            continue
         drafts.append(draft)
         # 增量收集本段草稿的小节标题（任意 ##/### 层级，供后续段去重参考）
         for raw_t in re.findall(r"^#{1,4}\s+(.+?)\s*$", draft, re.M):
@@ -639,6 +1003,11 @@ def _summarize(full_text: str, meta: dict) -> str:
             if t and len(t) <= 24 and t not in covered:
                 covered.append(t)
         print(f"[纪要] 段 {i}/{n} 草稿 {len(draft)} 字符 (用时 {time.time()-t0:.0f}s)", flush=True)
+    if failed:
+        print(f"[纪要] 注意：第 {','.join(map(str, failed))}/{n} 段未能整理，最终纪要缺少这些段落内容", flush=True)
+    if not drafts:
+        raise RuntimeError(f"全部 {n} 段整理均失败，无法生成纪要")
+    CFG["_last_course_title"] = (meta.get("title") or "").strip()   # 供小节标题纠偏
     summary = _stitch_drafts(drafts)  # 统一拼接：同名/相似小节归并 + 条目去重
     # 公式分隔符强制转 Obsidian 兼容格式（7B 可能不遵守 prompt 的 $$ 要求，这里兜底强制）
     summary = (
@@ -663,6 +1032,12 @@ def generate_note(full_text: str) -> dict:
             title = parts[0]
     meta["title"] = title
     print(f"[纪要] 学科={meta['subject']} 课程={meta['course']} 标题={meta['title']}，生成知识点 ...")
+    if meta["subject"] == "待整理":
+        # 2026-09-17 实证：非课程音频（90 分钟整段"点赞订阅"提示词）会被 7B 照
+        # prompt 里的术语示例幻觉编造成整课纪要（伪精确比留白更毒）。
+        # 宁缺毋滥：未识别出学科就不生成纪要正文，只归档转写原文。
+        print("[纪要] 未识别为已知学科（内容可能不是课堂录音），跳过纪要生成，只归档转写")
+        return {**meta, "summary_md": "", "fixed_text": fixed}
     t0 = time.time()
     summary = _summarize(fixed, meta)
     print(f"[纪要] 完成，用时 {time.time() - t0:.0f}s")
@@ -689,6 +1064,20 @@ def normalize_subject(name: str) -> str:
     return "待整理"
 
 
+def unique_lesson(lesson: str, is_taken) -> str:
+    """同日同标题冲突时生成唯一 lesson 名（音频/meta/转写/纪要四个文件统一使用）。
+    is_taken(名字) 返回 True 表示该名字已被任一目标文件占用。
+    冲突时追加可读序号：{lesson}_2、{lesson}_3…（不使用 Unix 时间戳这类不可读后缀）。
+    纯函数，便于单测（2026-09-17 修复：此前只对音频做同名兜底，同日同标题的
+    转写/纪要/meta 会用原 lesson 名互相覆盖）。"""
+    if not is_taken(lesson):
+        return lesson
+    n = 2
+    while is_taken(f"{lesson}_{n}"):
+        n += 1
+    return f"{lesson}_{n}"
+
+
 def archive(path: Path, text: str, note: dict, file_hash: str = "") -> Path:
     date_str = datetime.now().strftime("%Y-%m-%d")
     # 学科归一化：只允许已知学科，未知的进"待整理"（不新建学科目录）
@@ -698,26 +1087,58 @@ def archive(path: Path, text: str, note: dict, file_hash: str = "") -> Path:
 
     # 结构：学科/{原材料,纪要,转写}/ 直接放文件（文件名 = 日期_标题）
     vault = Path(CFG["vault_dir"])
-    lesson = f"{date_str}_{title}"
     raw_dir = vault / subject / "原材料"
     note_dir = vault / subject / "纪要"
     trans_dir = vault / subject / "转写"
     for d in (raw_dir, note_dir, trans_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    # 音频 → 原材料/日期_标题.ext（同名加时间戳后缀，保证从 inbox 移走）
+    # 一次性确定唯一最终 lesson 名：移动音频和写任一文档之前先解析，
+    # 四个文件（音频/meta.json/转写.md/纪要.md）统一使用，杜绝同日同标题互相覆盖
+    def _taken(name: str) -> bool:
+        return any([
+            (raw_dir / f"{name}{path.suffix}").exists(),
+            (raw_dir / f"{name}.meta.json").exists(),
+            (note_dir / f"{name}.md").exists(),
+            (trans_dir / f"{name}.md").exists(),
+        ])
+
+    lesson = unique_lesson(f"{date_str}_{title}", _taken)
+
+    # 2026-09-17 修复：unique_lesson 通过后到 os.replace 之间仍有竞态窗口（另一课可能
+    # 刚创建同名文件），而 os.replace 对已存在目标是**静默覆盖**。这里在写任何文件前
+    # 再解析一次「真正可用的最终名」，并把它同时用于音频/meta/转写/纪要四处，
+    # 保证 meta["file"] 指向的音频名与实际落盘名一致。
+    def _all_free(name: str) -> bool:
+        """四处目标名（含 meta）当前都未被占用"""
+        return not any([
+            (raw_dir / f"{name}{path.suffix}").exists(),
+            (raw_dir / f"{name}.meta.json").exists(),
+            (note_dir / f"{name}.md").exists(),
+            (trans_dir / f"{name}.md").exists(),
+        ])
+
+    if not _all_free(lesson):
+        n = 2
+        while not _all_free(f"{lesson}_{n}"):
+            n += 1
+        lesson = f"{lesson}_{n}"
+        print(f"[归档] 目标名被占用，改用 {lesson}")
+
     audio_dst = raw_dir / f"{lesson}{path.suffix}"
-    if audio_dst.exists():
-        audio_dst = raw_dir / f"{lesson}_{int(time.time())}{path.suffix}"
-    shutil.move(str(path), str(audio_dst))
+    transcript_dst = trans_dir / f"{lesson}.md"
+    note_dst = note_dir / f"{lesson}.md"
+    meta_dst = raw_dir / f"{lesson}.meta.json"
+    temp_paths = [
+        trans_dir / f".{lesson}.md.part",
+        note_dir / f".{lesson}.md.part",
+        raw_dir / f".{lesson}.meta.json.part",
+    ]
+    created_final = []
 
-    # 转写 → 转写/日期_标题.md
-    (trans_dir / f"{lesson}.md").write_text(
-        f"# {title}\n\n学科：{subject}｜课程：{course}｜日期：{date_str}\n\n{text}\n",
-        encoding="utf-8",
+    transcript = (
+        f"# {title}\n\n学科：{subject}｜课程：{course}｜日期：{date_str}\n\n{text}\n"
     )
-
-    # 纪要 → 纪要/日期_标题.md
     frontmatter = (
         f"---\n"
         f"title: {title}\n"
@@ -727,10 +1148,9 @@ def archive(path: Path, text: str, note: dict, file_hash: str = "") -> Path:
         f"tags: [课堂笔记, {subject}]\n"
         f"---\n\n"
     )
-    (note_dir / f"{lesson}.md").write_text(
-        frontmatter + (note.get("summary_md") or ""), encoding="utf-8"
-    )
-
+    summary_md = note.get("summary_md") or ""
+    if not summary_md:
+        summary_md = "> 未生成纪要：本课未识别为已知学科（内容可能不是课堂录音），转写原文已归档。\n"
     meta = {
         "file": audio_dst.name,
         "subject": subject,
@@ -740,11 +1160,48 @@ def archive(path: Path, text: str, note: dict, file_hash: str = "") -> Path:
         "file_hash": file_hash,
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
-    (raw_dir / f"{lesson}.meta.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+
+    # 先在目标目录同卷写入临时文件，再移动音频，最后用 os.replace 原子切换。
+    # 任一步失败都清理临时文件并尽力把音频移回原 inbox，避免留下半归档。
+    moved_audio = False
+    try:
+        # 2026-09-17 修复：先移音频再写临时文件。原顺序下「临时文件写入失败」
+        # 会把已移入 vault 的音频回滚（备份目录还多一份），且 temp_paths[2] 失败时
+        # 回滚循环里 final 可能被 unlink —— 先移音频后写文件彻底避开。
+        shutil.move(str(path), str(audio_dst))
+        moved_audio = True
+        temp_paths[0].write_text(transcript, encoding="utf-8")
+        temp_paths[1].write_text(frontmatter + summary_md, encoding="utf-8")
+        temp_paths[2].write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        for tmp, final in zip(temp_paths, (transcript_dst, note_dst, meta_dst)):
+            if final.exists():
+                # 最后一道防线：_all_free 之后到这里的极窄窗口内被抢占，
+                # 宁可报错让本课进 _失败 目录，也绝不覆盖别人的笔记
+                raise FileExistsError(f"归档目标已被占用（拒绝覆盖）：{final}")
+            os.replace(str(tmp), str(final))
+            created_final.append(final)
+    except Exception:
+        for tmp in temp_paths:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+        for final in created_final:
+            try:
+                if final.exists():
+                    final.unlink()
+            except Exception:
+                pass
+        if moved_audio and audio_dst.exists() and not path.exists():
+            try:
+                shutil.move(str(audio_dst), str(path))
+            except Exception as rollback_error:
+                print(f"[归档] 回滚音频失败：{rollback_error}", flush=True)
+        raise
+
     print(f"[归档] -> {vault / subject}（原材料/纪要/转写）")
-    return note_dir / f"{lesson}.md"
+    return note_dst
 
 
 # ---------------- 知识补全（归档后自动执行） ----------------
@@ -825,12 +1282,22 @@ def process_one(path: str):
             dst = move_to(p, "_重复")
             print(f"[跳过] 内容已处理过（{p.name}）-> {dst}")
             return
-        text = transcribe(str(p))
-        release_whisper()  # 释放转写模型显存，7B 独占 GPU（large-v3+7B 同驻超 8GB 会卡死）
+        try:
+            text = transcribe(str(p))
+        finally:
+            # 转写成功或异常都释放模型，避免下一次纪要/转写继续占用显存。
+            release_whisper()
         note = generate_note(text)
         fixed = note.pop("fixed_text", text)   # 纠正后的文本给知识补全用（转写文件保留原文）
         note_path = archive(p, text, note, file_hash=h)
-        knowledge_patch(note_path, fixed, note)   # 归档后自动知识补全（7B + 维基查证）
+        if note.get("summary_md"):
+            try:
+                knowledge_patch(note_path, fixed, note)   # 归档后自动知识补全（7B + 维基查证）
+            except Exception as e:
+                # 补全失败不影响已归档纪要（设计约定），降级为警告
+                print(f"[补全] 失败（纪要已归档，不影响使用）: {e}")
+        else:
+            print("[补全] 无纪要正文，跳过知识补全")
         PROCESSED_HASHES.add(h)
         print(f"===== 完成: {p.name} =====\n")
     except Exception as e:
@@ -869,6 +1336,16 @@ def is_ready_audio(f: Path, stable: dict, now: float) -> bool:
     return now - prev[1] >= STABLE_SECONDS
 
 
+def seen_cleanup(seen: set, stable: dict, name: str):
+    """处理完一个文件后清理其黑名单与稳定记录（2026-09-17 修复）。
+    此前 seen 以文件名为键且只增不减：处理完 A.m4a 后，若 inbox 再次出现
+    内容不同但同名的 A.m4a，会被永久静默跳过。清理后，同名同大小的新文件
+    仍必须重新经过完整 STABLE_SECONDS 稳定检测（stable 也要清，防止新文件
+    直接沿用旧 (size, first_seen) 而跳过稳定等待）。"""
+    seen.discard(name)
+    stable.pop(name, None)
+
+
 def main_loop():
     global PROCESSED_HASHES
     inbox = Path(CFG["inbox_dir"])
@@ -884,11 +1361,14 @@ def main_loop():
         try:
             now = time.time()
             for f in sorted(inbox.iterdir()):
+                if STOP_FLAG:
+                    break
                 if f.name in seen:
                     continue
                 if is_ready_audio(f, stable, now):
                     seen.add(f.name)
                     process_one(str(f))
+                    seen_cleanup(seen, stable, f.name)
             time.sleep(3)
         except KeyboardInterrupt:
             break
