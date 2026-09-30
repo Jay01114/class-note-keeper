@@ -51,6 +51,9 @@ credentials.json
 service-account*.json
 .ollama/
 
+# 本机多 Agent 交接记录，不作为面向用户的发布内容
+diff.md
+
 # ========== 系统与编辑器 ==========
 Thumbs.db
 Desktop.ini
