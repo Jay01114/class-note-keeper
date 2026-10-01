@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Rebuild meeting notes from archived transcripts without re-running transcription.
+"""纪要重跑工具（不重新转写）：读 vault/{学科}/转写/*.md → 新逻辑重新生成纪要 → 覆盖写回纪要/同名.md。
 
-Usage: python src/rerun_note.py <keyword>
-The matching transcript is read from vault/会议/转写 and its paired note is updated.
+用途：core.py 的 SUMMARIZE_REQ / 低信息区清理等改动后，对已归档课程按新逻辑重出纪要，验证/升级质量。
+whisper 零调用（转写文件已在 vault）；可选 --patch 在写回后追加知识补全（7B+维基，较慢）。
+
+用法（用项目自带 venv，托管 python 缺 requests/json5）：
+  D:/课堂笔记管家/app/.venv/Scripts/python.exe app/rerun_note.py "概率论/2026-09-07_条件独立与概率计算"
+  D:/课堂笔记管家/app/.venv/Scripts/python.exe app/rerun_note.py "电路、信号和系统/叠加定理" --patch
+  # 关键字匹配 vault/转写 下所有含关键字的课
 """
 import sys
 import io
-import json
+import re
 import time
 from pathlib import Path
 
@@ -16,61 +21,108 @@ sys.path.insert(0, str(Path(__file__).parent))
 import core  # noqa: E402
 
 VAULT = Path(core.CFG["vault_dir"])
-TRANSCRIPTS = VAULT / "会议" / "转写"
-NOTES = VAULT / "会议" / "纪要"
 
 
 def find_trans(keyword: str) -> list:
-    return [p for p in sorted(TRANSCRIPTS.glob("*.md"))
-            if keyword in p.name or keyword in p.read_text(encoding="utf-8")[:2000]]
+    """vault 全部转写 md 中匹配关键字的文件（不含"待整理"）"""
+    hits = []
+    for f in sorted(VAULT.rglob("转写/*.md")):
+        if "待整理" in str(f):
+            continue
+        if keyword in str(f) or keyword in f.name:
+            hits.append(f)
+    return hits
 
 
-def rerun(transcript_path: Path) -> Path:
-    text = transcript_path.read_text(encoding="utf-8")
-    print(f"\n===== 重跑会议纪要: {transcript_path.name} =====", flush=True)
-    started = time.time()
+def rerun(trans_md: Path, do_patch: bool = False) -> Path:
+    """重跑单课纪要：generate_note（新逻辑）→ 覆盖写回纪要同名 md → 可选知识补全"""
+    text = trans_md.read_text(encoding="utf-8")
+    print(f"\n===== 重跑纪要: {trans_md.name} =====", flush=True)
+    t0 = time.time()
     note = core.generate_note(text)
-    print(f"[纪要] 生成完成，用时 {time.time() - started:.0f}s", flush=True)
+    print(f"[纪要] 生成完成，用时 {time.time() - t0:.0f}s", flush=True)
 
-    note_path = NOTES / transcript_path.name
-    if not note_path.exists():
-        raise FileNotFoundError(f"对应纪要不存在，拒绝创建可能错配的文件：{note_path}")
-    old = note_path.read_text(encoding="utf-8")
-    preserved = []
+    # 纪要路径 = 同级目录把"转写"换"纪要"
+    note_dir = trans_md.parent.parent / "纪要"
+    note_path = note_dir / trans_md.name
+
+    # 2026-09-17 新增：标题术语纠正后（如"变延敏感"→"边沿敏感"）四条文件名要一起改，
+    # 否则「新标题写进旧文件名」+ 旧纪要残留在 vault（四处不同步）。
+    new_title = (note.get("title") or "").strip()
+    old_lesson = trans_md.stem
+    if new_title and "_" in old_lesson and old_lesson[:4].isdigit():
+        date_part, _, old_title = old_lesson.partition("_")
+        new_lesson = f"{date_part}_{new_title}"
+        if new_title != old_title:
+            base = trans_md.parent.parent
+            fmap = [
+                (base / "转写" / f"{old_lesson}.md", base / "转写" / f"{new_lesson}.md"),
+                (note_dir / f"{old_lesson}.md", note_dir / f"{new_lesson}.md"),
+                (base / "原材料" / f"{old_lesson}.m4a", base / "原材料" / f"{new_lesson}.m4a"),
+                (base / "原材料" / f"{old_lesson}.meta.json",
+                 base / "原材料" / f"{new_lesson}.meta.json"),
+            ]
+            for src, dst in fmap:
+                if src.exists() and not dst.exists():
+                    src.rename(dst)
+                    print(f"[改名] {src.name} -> {dst.name}", flush=True)
+            trans_md = base / "转写" / f"{new_lesson}.md"
+            note_path = note_dir / f"{new_lesson}.md"
+            try:   # 转写文件首行 `# 旧标题` 一并更新，保持四处一致
+                tr = trans_md.read_text(encoding="utf-8")
+                tr = re.sub(r"^#\s*" + re.escape(old_title) + r"\s*$",
+                            f"# {new_title}", tr, count=1, flags=re.M)
+                trans_md.write_text(tr, encoding="utf-8")
+            except Exception as e:
+                print(f"[改名] 转写标题同步失败：{e}", flush=True)
+            # meta.json 里的 title/file 同步（必须显式带 .meta.json，Path.suffix 会拆坏）
+            mp = base / "原材料" / f"{new_lesson}.meta.json"
+            if mp.exists():
+                try:
+                    import json as _json
+                    mj = _json.loads(mp.read_text(encoding="utf-8"))
+                    mj["title"] = new_title
+                    mj["file"] = f"{new_lesson}.m4a"
+                    mp.write_text(_json.dumps(mj, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception as e:
+                    print(f"[改名] meta.json 同步失败：{e}", flush=True)
+
+    # 保留原 frontmatter（subject/course/date/tags），只换正文。
+    # 2026-09-17 修复：旧 frontmatter 的 title 是「重跑前」的（可能含已被纠正的错字），
+    # 原样保留会让新纪要顶着旧错标题 —— title 一律用本次生成的结果覆盖。
+    old = note_path.read_text(encoding="utf-8") if note_path.exists() else ""
+    fm_lines = []
     if old.startswith("---"):
         parts = old.split("---", 2)
         if len(parts) >= 3:
-            preserved = [line for line in parts[1].strip().splitlines()
-                         if line.startswith(("file_datetime:", "time_source:", "date:", "tags:"))]
-    title = note.get("title") or "未命名会议"
-    topic = note.get("topic") or "未明确"
-    datetime_value = next((line.split(":", 1)[1].strip() for line in preserved
-                           if line.startswith("file_datetime:")), "未记录")
-    time_source = next((line.split(":", 1)[1].strip() for line in preserved
-                        if line.startswith("time_source:")), "未记录")
-    fm_lines = [f"title: {json.dumps(title, ensure_ascii=False)}",
-                f"meeting_topic: {json.dumps(topic, ensure_ascii=False)}",
-                *preserved]
-    fm = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
-    (NOTES / ".").mkdir(parents=True, exist_ok=True)
-    note_path.write_text(
-        fm + f"# {title}\n\n会议主题：{topic}｜文件时间：{datetime_value}\n"
-        f"> 文件名/修改时间不一定等于会议开始时间。时间来源：{time_source}\n\n"
-        + (note.get("summary_md") or ""),
-        encoding="utf-8",
-    )
-    print(f"[写回] -> {note_path}", flush=True)
+            fm_lines = [l for l in parts[1].strip().splitlines()
+                        if l.startswith(("title:", "subject:", "course:", "date:", "tags:"))
+                        and not l.startswith("title:")]
+    real_title = new_title or (note.get("title") or "").strip()
+    if real_title:
+        fm_lines.insert(0, f"title: {real_title}")
+    fm = "---\n" + "\n".join(fm_lines) + "\n---\n\n" if fm_lines else ""
+
+    note_path.write_text(fm + (note.get("summary_md") or ""), encoding="utf-8")
+    print(f"[写回] -> {note_path}（{len(note.get('summary_md') or '')} 字符）", flush=True)
+
+    if do_patch:
+        print("[补全] 开始知识补全（7B+维基，较慢）...", flush=True)
+        core.knowledge_patch(note_path, note.get("fixed_text", text), note)
+        print("[补全] 完成", flush=True)
     return note_path
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1].startswith("--"):
+    if len(sys.argv) < 2:
         print(__doc__)
-        sys.exit(2)
-    matches = find_trans(sys.argv[1])
-    if not matches:
-        print(f"[无匹配] 会议转写下找不到含 '{sys.argv[1]}' 的文件")
         sys.exit(1)
-    for transcript in matches:
-        rerun(transcript)
+    keyword = sys.argv[1]
+    do_patch = "--patch" in sys.argv
+    files = find_trans(keyword)
+    if not files:
+        print(f"[无匹配] vault 转写下找不到含 '{keyword}' 的课程")
+        sys.exit(1)
+    for f in files:
+        rerun(f, do_patch)
     print("\n===== 全部完成 =====")

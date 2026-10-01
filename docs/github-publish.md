@@ -7,13 +7,13 @@ GitHub 新建仓库页需要填的内容，直接照抄：
 | 字段 | 建议填写 |
 |---|---|
 | **Repository name** | `class-note-keeper`（或 `lecture-note-automator`） |
-| **Description** | `Local-first meeting recording organizer: faster-whisper transcription → Ollama/Qwen minutes → Obsidian. 本地优先的录音转写与会议纪要整理。` |
+| **Description** | `Local-first lecture note pipeline: phone recording → faster-whisper transcription → Ollama/Qwen summary → Obsidian vault. 本地优先的课堂录音自动整理流水线。` |
 | **Public** | 选 **Public**（公开） |
 | **Add a README** | 勾选（仓库会自动生成，但我们会用仓库里的 README.md 覆盖） |
 | **Add .gitignore** | 选 **Python** |
 | **Choose a license** | 选 **MIT License** |
 
-创建后，上传 3.1 副本中的发布文件（README.md、LICENSE、.gitignore、config.example.json、src/、docs/、icon.ico、VERSION）。不要上传本机交接用 `diff.md`、个人配置、录音、Vault 或模型文件。
+创建后，把 `opensource/` 目录下的所有文件（README.md、LICENSE、.gitignore、config.example.json、src/、docs/）上传覆盖即可。
 
 ## 二、关于"语音识别没成功"
 
@@ -45,7 +45,7 @@ desktop-app
 ## 四、发布前检查清单
 
 - [ ] `README.md` 已更新（README 里的"仓库地址"占位符换成真实地址）
-- [ ] `docs/agent-prompt.md` 中的维护约束与当前版本一致
+- [ ] `docs/agent-prompt.md` 里的 `<此处填仓库地址>` 已替换
 - [ ] `config.json`（含本机路径的）**没有**被提交（.gitignore 已排除；只提交 `config.example.json`）
 - [ ] `models/`、`inbox/`、`vault/` 等本地数据目录未被提交
 - [ ] LICENSE 已选 MIT（README 底部有对应徽章可加）

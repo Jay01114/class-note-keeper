@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""录音整理管家 · 桌面版 3.1
+"""课堂笔记管家 · 桌面版 V3（UI 成熟化重构版）
 四层信息架构：头部（状态 chip）→ 动作栏 → 任务/日志（QSplitter）→ 底部状态条。
 本轮变更（2026-09-17）：
   - 视觉 token 集中化（浅色主题，颜色/字体/尺寸统一管理）
@@ -10,7 +10,7 @@
   - 设置对话框防静默降档（未识别模型路径保持原值），路径校验行内错误
   - 单实例改为 QLocalServer/QLocalSocket，二次启动唤回已有窗口
   - 任务卡片（计数/操作列/空状态引导）、日志卡片（时间戳/级别/复制/自动滚动）
-  - 会议版：纪要与口语纠错提示词、会议主题展示及归档时间说明
+  - 内核修复：转写后释放显存、知识补全用纠正后文本、手动队列响应停止
 """
 import sys
 import io
@@ -46,8 +46,8 @@ OLLAMA_EXE = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / 
 # 因此这里显式兜底传入，保证无论从哪启动都能找到 D 盘模型。
 OLLAMA_MODELS_DIR = Path(core.CFG.get("models_dir", str(core._APP_ROOT / "models"))) / "ollama"
 
-APP_NAME = "录音整理管家"
-INSTANCE_KEY = "录音整理管家_LocalInstance_v1"
+APP_NAME = "课堂笔记管家"
+INSTANCE_KEY = "课堂笔记管家_LocalInstance_v1"
 SETTINGS_ORG = "ClassNoteKeeper"
 SETTINGS_APP = APP_NAME
 
@@ -566,7 +566,7 @@ def unique_dst_name(inbox: Path, name: str, reserved=None) -> Path:
 class Worker(QThread):
     log_line = Signal(str)                      # 日志行
     task_state = Signal(str, str)               # (文件名, 状态文本)
-    task_meta = Signal(str, str, str)           # (文件名, 会议主题, 标题)
+    task_meta = Signal(str, str, str)           # (文件名, 学科, 标题)
     task_done = Signal(str, str, float, str)    # (文件名, 终态, 耗时秒, 笔记目录)
     progress = Signal(str, str, int)            # (文件名, 阶段, 百分比；-1=不可预估)
 
@@ -694,12 +694,26 @@ class Worker(QThread):
             self.task_state.emit(name, "AI 整理中")
             self.progress.emit(name, "AI 整理", -1)   # 不可预估
             note = core.generate_note(text)
+            # 内核修复（2026-09-17）：知识补全必须用术语纠正后的 fixed_text（与 CLI 一致）；
+            # 转写文件仍保存原始 text。
+            fixed = note.pop("fixed_text", text)
             # ---- 归档 ----
             self.task_state.emit(name, "归档中")
             self.progress.emit(name, "归档", -1)
             note_path = core.archive(p, text, note, file_hash=h)
+            # ---- 知识补全 ----
+            if note.get("summary_md"):
+                self.task_state.emit(name, "知识补全中")
+                self.progress.emit(name, "知识补全", -1)
+                try:
+                    core.knowledge_patch(note_path, fixed, note)
+                except Exception as e:
+                    # 补全失败不影响已归档纪要（设计约定），降级为警告
+                    self.log_line.emit(f"[补全] 失败（纪要已归档，不影响使用）: {e}")
+            else:
+                self.log_line.emit("[补全] 无纪要正文（未识别学科），跳过知识补全")
             core.PROCESSED_HASHES.add(h)
-            self.task_meta.emit(name, note.get("topic", ""), note.get("title", ""))
+            self.task_meta.emit(name, note.get("subject", ""), note.get("title", ""))
             self.task_state.emit(name, "完成")
             self.progress.emit(name, "完成", 100)
             self.task_done.emit(name, "完成", time.time() - t0, str(note_path.parent))
@@ -912,7 +926,7 @@ class CloseDialog(QDialog):
 
     def __init__(self, parent, running: bool, tray_available: bool):
         super().__init__(parent)
-        self.setWindowTitle(f"关闭 {APP_NAME}")
+        self.setWindowTitle("关闭 课堂笔记管家")
         self.setMinimumWidth(440)
         self.choice = None
         v = QVBoxLayout(self)
@@ -1286,17 +1300,9 @@ class MainWindow(QMainWindow):
         table_page = QWidget()
         tp = QVBoxLayout(table_page)
         tp.setContentsMargins(0, 0, 0, 0)
-        time_notice = QLabel("归档时间取自录音文件名或文件修改时间，不一定等于会议开始时间。")
-        time_notice.setWordWrap(True)
-        time_notice.setStyleSheet(f"color: {C['text_secondary']}; padding: 2px 4px;")
-        tp.addWidget(time_notice)
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["录音文件", "会议主题", "纪要标题", "状态", "耗时", "操作"])
-        self.table.horizontalHeaderItem(1).setToolTip(
-            "归档文件名中的时间取自录音文件名或文件修改时间，不一定等于会议开始时间。")
-        self.table.horizontalHeaderItem(2).setToolTip(
-            "录音文件名中的时间取自文件名或文件修改时间，不一定等于会议开始时间。")
+            ["录音文件", "学科", "笔记标题", "状态", "耗时", "操作"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.table.setColumnWidth(1, 150)
@@ -1764,7 +1770,7 @@ class MainWindow(QMainWindow):
     def _status_dot_color(self, text: str) -> str:
         if text in self.STATUS_DOT:
             return self.STATUS_DOT[text]
-        if text.startswith(("转写中", "AI 整理", "归档")):
+        if text.startswith(("转写中", "AI 整理", "归档", "知识补全")):
             return C["brand"]
         return C["text_secondary"]
 
@@ -1781,10 +1787,10 @@ class MainWindow(QMainWindow):
         self._ensure_row(name)
         self._set_row_status(name, state)
 
-    def on_task_meta(self, name, topic, title):
+    def on_task_meta(self, name, subject, title):
         row = self._ensure_row(name)
-        if topic:
-            self.table.setItem(row, 1, QTableWidgetItem(topic))
+        if subject:
+            self.table.setItem(row, 1, QTableWidgetItem(subject))
         if title:
             self.table.setItem(row, 2, QTableWidgetItem(title))
 
@@ -1797,7 +1803,7 @@ class MainWindow(QMainWindow):
         self.status_file.setText(f"当前文件：{name}")
         self.status_phase.setText(phase)
         if pct < 0:
-            self.progress.setRange(0, 0)   # AI 整理 / 归档进度不可预估
+            self.progress.setRange(0, 0)   # 不确定进度（AI 整理 / 知识补全等）
             self.status_pct.setText("不可预估")
         else:
             self.progress.setRange(0, 100)
@@ -1946,7 +1952,7 @@ class MainWindow(QMainWindow):
             return
         # 2026-09-17 修复：旧实现只有一个「警告 + 再等 30 秒」按钮，用户如果执意
         # 退出就陷入无限弹窗循环（每 30 秒弹一次，永远退不掉），只能去任务管理器杀进程。
-        # 线程内部在 transcribe / generate_note 期间并不检查 STOP_FLAG，
+        # 线程内部在 transcribe / generate_note / knowledge_patch 期间并不检查 STOP_FLAG，
         # 所以「等它自己结束」可能等非常久。这里改成一次性给用户明确选择：
         #   继续等待（默认，安全） / 立即强制退出（明确告知风险）。
         # 强制退出不再调 QThread.terminate（会打断文件写入造成半归档），
